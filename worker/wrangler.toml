@@ -1,0 +1,9 @@
+name = "remynd-claude-install"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+account_id = "7f1947c685df6d855f9f87331cd8a72a"
+workers_dev = false
+
+routes = [
+  { pattern = "remyndai.com/claude/*", zone_name = "remyndai.com" }
+]
