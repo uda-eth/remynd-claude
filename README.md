@@ -12,7 +12,7 @@ bash <(curl -fsSL https://remyndai.com/claude/install.sh)
 or, straight from this repo:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/move37-com/remynd-claude/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/uda-eth/remynd-claude/main/install.sh)
 ```
 
 Re-running is safe (idempotent). It only ever writes inside `~/.claude`.
