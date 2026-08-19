@@ -39,6 +39,33 @@ for two minutes, and your *next* prompt carries that. It never goes stale mid-se
 
 ---
 
+## Any agent, not just coding ones
+
+ReMynd also speaks [MCP](https://modelcontextprotocol.io), so assistants that never touch a terminal
+can use your history too.
+
+**Same-machine clients** — Claude Desktop, Cursor, VS Code, Gemini CLI — are wired up by the
+installer. Restart the app and ask it what you did yesterday.
+
+**Off-device agents** — ChatGPT, or an assistant that texts you — need a public HTTPS endpoint:
+
+```bash
+remynd-remote start     # prints a connector URL to paste in
+remynd-remote rotate    # mint a new token; every old URL dies
+remynd-remote stop
+```
+
+The endpoint runs on your Mac and is published through **your own tunnel on your own account**.
+ReMynd operates no relay and keeps no copy — we are not in the path. That does change the sentence
+we can honestly say:
+
+> **Local only:** your activity goes to your own agent, and nowhere else.
+> **With remote on:** your activity goes to your own agent, over your own tunnel, on your own
+> account. ReMynd runs no relay and keeps no copy.
+
+Both are true; the second is the one that applies the moment a tunnel is live. The connector URL is
+a key to your screen history — treat it like a password, and rotate it when you are done.
+
 ## The `remynd` command
 
 The same retrieval your agent uses, available to you directly:

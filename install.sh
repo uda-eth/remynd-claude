@@ -30,6 +30,7 @@ warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 CORE_FILES="remynd remynd-lib.sh remynd-digest.sh remynd-refresh.sh remynd-session-hook.sh remynd-delta-hook.sh remynd-settings.sh"
+MCP_FILES="remynd-mcp remynd-remote.sh"
 
 # ---------------------------------------------------------------------------
 # Uninstall
@@ -83,6 +84,29 @@ else
 fi
 chmod +x "$CORE_DIR"/* 2>/dev/null || true
 ln -sf "$CORE_DIR/remynd" "$BIN_DIR/remynd"
+
+# ---------------------------------------------------------------------------
+# 1b. The MCP server — one native binary, both transports, no runtime deps.
+#
+# This is what lets any agent use ReMynd, not just coding ones: Claude Desktop,
+# Cursor, VS Code and Gemini CLI launch it over stdio; ChatGPT and other
+# off-device agents reach it over HTTP through the user's own tunnel.
+# ---------------------------------------------------------------------------
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/../../../mcp/remynd-mcp" ]; then
+  cp "$SRC_DIR/../../../mcp/remynd-mcp" "$BIN_DIR/remynd-mcp" 2>/dev/null || true
+  cp "$SRC_DIR/../../../mcp/remynd-remote.sh" "$BIN_DIR/remynd-remote" 2>/dev/null || true
+else
+  curl -fsSL "$REPO_RAW/mcp/remynd-mcp" -o "$BIN_DIR/remynd-mcp" 2>/dev/null || true
+  curl -fsSL "$REPO_RAW/mcp/remynd-remote.sh" -o "$BIN_DIR/remynd-remote" 2>/dev/null || true
+fi
+chmod +x "$BIN_DIR/remynd-mcp" "$BIN_DIR/remynd-remote" 2>/dev/null || true
+if [ -x "$BIN_DIR/remynd-mcp" ] && "$BIN_DIR/remynd-mcp" --version >/dev/null 2>&1; then
+  ok "MCP server installed ($("$BIN_DIR/remynd-mcp" --version))"
+  HAVE_MCP=1
+else
+  warn "MCP server unavailable — the Claude Code hooks still work without it."
+  HAVE_MCP=0
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Config (PRD §5.6, §5.8 defaults)
@@ -191,6 +215,48 @@ Is it valid JSON? Check with: sqlite3 :memory: \"SELECT json_valid(readfile('$SE
   fi
   [ -f "$SKILL_DIR/SKILL.md" ] && ok "Claude Code: /remynd skill installed"
 fi
+
+# ---------------------------------------------------------------------------
+# 4b. MCP clients — Claude Desktop, Cursor, VS Code, Gemini CLI
+#
+# Each of these launches the server itself over stdio, so wiring one up is just
+# a JSON entry pointing at the binary. Every file is backed up before it is
+# touched and left alone entirely if it is not valid JSON.
+# ---------------------------------------------------------------------------
+add_mcp_client() {
+  local label="$1" cfg="$2" key="$3"
+  [ "$HAVE_MCP" = "1" ] || return 0
+  [ -d "$(dirname "$cfg")" ] || return 0
+
+  [ -f "$cfg" ] || echo '{}' > "$cfg"
+  if ! /usr/bin/sqlite3 :memory: "SELECT json_valid(readfile('$cfg'));" 2>/dev/null | grep -q '^1$'; then
+    warn "$label: its config is not valid JSON — leaving it alone."
+    return 0
+  fi
+
+  cp "$cfg" "$cfg.remynd-backup"
+  local esc merged
+  esc="$(/usr/bin/sed "s/'/''/g" "$cfg")"
+  merged="$(/usr/bin/sqlite3 :memory: "
+    WITH s(j) AS (SELECT json('$esc'))
+    SELECT json_set(
+             json_set(j, '\$.$key', json(COALESCE(json_extract(j, '\$.$key'), '{}'))),
+             '\$.$key.remynd',
+             json_object('command', '$BIN_DIR/remynd-mcp', 'args', json_array())
+           ) FROM s;" 2>/dev/null)"
+
+  if [ -n "$merged" ] && /usr/bin/sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$merged" | /usr/bin/sed "s/'/''/g")');" 2>/dev/null | grep -q '^1$'; then
+    printf '%s\n' "$merged" > "$cfg"
+    ok "$label: ReMynd added as an MCP server (restart $label to pick it up)"
+  else
+    cp "$cfg.remynd-backup" "$cfg"
+    warn "$label: could not update its config safely — restored the backup."
+  fi
+}
+
+add_mcp_client "Claude Desktop" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" "mcpServers"
+add_mcp_client "Cursor"         "$HOME/.cursor/mcp.json"                                              "mcpServers"
+add_mcp_client "Gemini CLI"     "$HOME/.gemini/settings.json"                                         "mcpServers"
 
 # ---------------------------------------------------------------------------
 # 5. Codex — AGENTS.md block + the remynd CLI
