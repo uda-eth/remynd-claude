@@ -91,6 +91,15 @@ remynd_sql() {
     /usr/bin/iconv -c -f UTF-8 -t UTF-8 2>/dev/null
 }
 
+# Same query path without the iconv pass. For results that cannot contain OCR
+# text — row ids, counts, timestamps — sanitising is pointless, and the extra
+# process shows up on the prompt-latency budget because the delta hook makes
+# several of these calls per prompt.
+remynd_sql_num() {
+  local db="$1"; shift
+  "$REMYND_SQLITE" -readonly -noheader -separator "$REMYND_FS" "file:$db?mode=ro&immutable=0" "$@" 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # JSON emission without jq
 #
@@ -167,14 +176,14 @@ remynd_config_get() {
 remynd_id_at_time() {
   local db="$1" table="$2" col="$3" target="$4"
   local lo hi mid t
-  lo="$(remynd_sql "$db" "SELECT COALESCE(MIN(id),0) FROM $table;")"
-  hi="$(remynd_sql "$db" "SELECT COALESCE(MAX(id),0) FROM $table;")"
+  lo="$(remynd_sql_num "$db" "SELECT COALESCE(MIN(id),0) FROM $table;")"
+  hi="$(remynd_sql_num "$db" "SELECT COALESCE(MAX(id),0) FROM $table;")"
   [ -z "$lo" ] && { echo 0; return; }
   [ "$hi" -le "$lo" ] && { echo "$lo"; return; }
 
   while [ "$lo" -lt "$hi" ]; do
     mid=$(( (lo + hi) / 2 ))
-    t="$(remynd_sql "$db" "SELECT $col FROM $table WHERE id >= $mid ORDER BY id ASC LIMIT 1;")"
+    t="$(remynd_sql_num "$db" "SELECT $col FROM $table WHERE id >= $mid ORDER BY id ASC LIMIT 1;")"
     if [ -z "$t" ]; then hi=$(( mid ))
     elif [ "$t" \< "$target" ]; then lo=$(( mid + 1 ))
     else hi=$(( mid )); fi

@@ -402,11 +402,11 @@ remynd_digest_delta() {
 # ---------------------------------------------------------------------------
 
 remynd_max_ocr_id() {
-  remynd_sql "$1" "SELECT COALESCE(MAX(id),0) FROM OCRTextSegment;"
+  remynd_sql_num "$1" "SELECT COALESCE(MAX(id),0) FROM OCRTextSegment;"
 }
 
 remynd_max_window_id() {
-  remynd_sql "$1" "SELECT COALESCE(MAX(id),0) FROM FocusedWindow;"
+  remynd_sql_num "$1" "SELECT COALESCE(MAX(id),0) FROM FocusedWindow;"
 }
 
 # remynd_ocr_since_id <db> <last_ocr_id> <last_window_id> <budget> <redact>
@@ -531,7 +531,9 @@ remynd_activity_rollup() {
   local db="$1" lo="$2" hi="$3" limit="${4:-14}"
   remynd_sql "$db" "
     SELECT CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) AS INT) secs,
-           applicationName, windowTitle
+           applicationName, windowTitle,
+           substr(datetime(MIN(startedAt),'localtime'),12,5),
+           substr(datetime(MAX(COALESCE(endedAt,startedAt)),'localtime'),12,5)
     FROM FocusedWindow
     WHERE id >= $lo AND id < $hi
       AND windowTitle IS NOT NULL AND windowTitle != ''
@@ -560,6 +562,8 @@ remynd_activity_rollup() {
       # Keep the shortest human title seen for this activity as the label.
       if (!(c in label) || length(t) < length(label[c])) label[c] = t
       if (!(c in app)) app[c] = $2
+      if (!(c in t0) || $4 < t0[c]) t0[c] = $4
+      if (!(c in t1) || $5 > t1[c]) t1[c] = $5
     }
     END {
       # Merge activities whose canonical key is a prefix of another: a window
@@ -578,6 +582,8 @@ remynd_activity_rollup() {
           if (length(ks[i]) < length(ks[j]) && index(ks[j], ks[i] " ") == 1) {
             secs[ks[i]] += secs[ks[j]]
             if (length(label[ks[j]]) < length(label[ks[i]])) label[ks[i]] = label[ks[j]]
+            if (t0[ks[j]] < t0[ks[i]]) t0[ks[i]] = t0[ks[j]]
+            if (t1[ks[j]] > t1[ks[i]]) t1[ks[i]] = t1[ks[j]]
             secs[ks[j]] = -1
             continue
           }
@@ -587,6 +593,8 @@ remynd_activity_rollup() {
           if (head3(ks[i]) != "" && head3(ks[i]) == head3(ks[j])) {
             secs[ks[i]] += secs[ks[j]]
             if (length(label[ks[j]]) < length(label[ks[i]])) label[ks[i]] = label[ks[j]]
+            if (t0[ks[j]] < t0[ks[i]]) t0[ks[i]] = t0[ks[j]]
+            if (t1[ks[j]] > t1[ks[i]]) t1[ks[i]] = t1[ks[j]]
             secs[ks[j]] = -1
           }
         }
@@ -602,7 +610,7 @@ remynd_activity_rollup() {
         if (s < 120) continue          # under two minutes is noise, not an activity
         h = int(s / 3600); m = int((s % 3600) / 60)
         if (h > 0) dur = sprintf("%dh%02dm", h, m); else dur = sprintf("%dm", m)
-        printf "  %-7s %s  (%s)\n", dur, label[keys[i]], app[keys[i]]
+        printf "  %-7s %s–%s  %s  (%s)\n", dur, t0[keys[i]], t1[keys[i]], label[keys[i]], app[keys[i]]
         shown++
       }
     }'
@@ -648,3 +656,4 @@ remynd_domains() {
       if (out != "") print out
     }'"'"'
 }
+

@@ -45,6 +45,27 @@ remynd status                   # profile, freshness, whether redaction is on
 | "what was I just reading" | `remynd recent 15` |
 | "what did that error say" | `remynd search "<error fragment>"` |
 
+## Answer with substance, not with minutes
+
+"You were in Gmail for 82 minutes" is an accounting answer to a question nobody asked. The user wants
+to know *what they did*: who they wrote to, what the thread was about, what they decided.
+
+`remynd day` gives each activity a **time span** for exactly this reason. Use it as a cursor:
+
+```bash
+remynd day 2026-08-18
+#   1h22m   18:24–19:48  Sent Mail - Gmail  (Google Chrome)
+remynd text "2026-08-18 18:24" "2026-08-18 19:48"     # everything on screen in that window
+```
+
+Then read that text and say what actually happened — the recipients, the subjects, the decisions.
+Do this for the two or three activities that matter to the question, not for all of them.
+
+**The OCR is messy and you are the one who can handle that.** It arrives as fragments, with garbled
+words and interface chrome mixed in. Don't quote it raw at the user; read across it and report what
+it means. Where a name or subject is too mangled to be sure of, leave it out rather than guessing —
+a confident wrong recipient is worse than an omission.
+
 **Search first, then widen.** `remynd search` gives you timestamps; feed a promising timestamp into
 `remynd text "<from>" "<to>"` to read everything that was on screen around it. That two-step is how
 you answer "I saw something about this last week but I can't remember where".

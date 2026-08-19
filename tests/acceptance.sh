@@ -56,7 +56,14 @@ printf '%s' "$CTX" | grep -q "ReMynd — your recent activity" && ok "digest pre
 head_ "AC2/AC4 — deltas carry OCR body text, deduped, within cap"
 MAXO="$(remynd_max_ocr_id "$DB")"; MAXW="$(remynd_max_window_id "$DB")"
 D="$REMYND_STATE_DIR/delta.txt"
-remynd_digest_delta_id "$DB" $((MAXO-400)) $((MAXW-30)) 6000 1 > "$D" 2>/dev/null
+# This checks that OCR body text is DELIVERED, so the agent-UI filter must be
+# off here: on a live profile the most recent frames are the agent's own
+# terminal, which that filter correctly removes, leaving nothing to assert on.
+# The filter has its own test further down.
+AC2DIR="$(mktemp -d)"; grep -v exclude_agent_ui "$REMYND_STATE_DIR/config" > "$AC2DIR/config"
+echo "exclude_agent_ui=0" >> "$AC2DIR/config"
+REMYND_STATE_DIR="$AC2DIR" bash -c ". \"$CORE/remynd-digest.sh\"; remynd_digest_delta_id \"$DB\" $((MAXO-400)) $((MAXW-30)) 6000 1" > "$D" 2>/dev/null
+rm -rf "$AC2DIR"
 if [ -s "$D" ]; then
   grep -q '^  > ' "$D" && ok "delta contains verbatim OCR lines" || bad "delta has no OCR body text"
   T=$(( $(wc -c < "$D") / 4 ))
