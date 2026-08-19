@@ -145,20 +145,26 @@ hd "Config schemas match what each client documents"
 # mcpServers object in ~/.gemini/settings.json; Cursor uses the same shape as
 # Claude Desktop in ~/.cursor/mcp.json.
 CHK="$(mktemp -d)"
-for SPEC in "Claude Desktop:Library/Application Support/Claude/claude_desktop_config.json" \
-            "Cursor:.cursor/mcp.json" \
-            "Gemini CLI:.gemini/settings.json"; do
-  NAME="${SPEC%%:*}"; REL="${SPEC#*:}"
+# key and required "type" differ per client — VS Code is the odd one out.
+for SPEC in "Claude Desktop:Library/Application Support/Claude/claude_desktop_config.json:mcpServers:" \
+            "Cursor:.cursor/mcp.json:mcpServers:" \
+            "Gemini CLI:.gemini/settings.json:mcpServers:" \
+            "VS Code:Library/Application Support/Code/User/mcp.json:servers:stdio"; do
+  NAME="$(printf '%s' "$SPEC" | cut -d: -f1)"
+  REL="$(printf '%s' "$SPEC" | cut -d: -f2)"
+  KEY="$(printf '%s' "$SPEC" | cut -d: -f3)"
+  WANT_TYPE="$(printf '%s' "$SPEC" | cut -d: -f4)"
   H="$CHK/$(echo "$NAME" | tr -d ' ')"; mkdir -p "$H/$(dirname "$REL")"
   echo '{"existing":{"keep":true}}' > "$H/$REL"
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." && HOME="$H" bash install.sh >/dev/null 2>&1 )
-  CMD="$(/usr/bin/sqlite3 :memory: "SELECT json_extract(readfile('$H/$REL'), '\$.mcpServers.remynd.command');" 2>/dev/null)"
+  CMD="$(/usr/bin/sqlite3 :memory: "SELECT json_extract(readfile('$H/$REL'), '\$.$KEY.remynd.command');" 2>/dev/null)"
   KEPT="$(/usr/bin/sqlite3 :memory: "SELECT json_extract(readfile('$H/$REL'), '\$.existing.keep');" 2>/dev/null)"
-  ARGS="$(/usr/bin/sqlite3 :memory: "SELECT json_type(readfile('$H/$REL'), '\$.mcpServers.remynd.args');" 2>/dev/null)"
-  if [ -n "$CMD" ] && [ "$ARGS" = "array" ] && [ "$KEPT" = "1" ]; then
-    ok "$NAME: mcpServers.remynd.command set, args is an array, existing keys kept"
+  ARGS="$(/usr/bin/sqlite3 :memory: "SELECT json_type(readfile('$H/$REL'), '\$.$KEY.remynd.args');" 2>/dev/null)"
+  TYPE="$(/usr/bin/sqlite3 :memory: "SELECT COALESCE(json_extract(readfile('$H/$REL'), '\$.$KEY.remynd.type'),'');" 2>/dev/null)"
+  if [ -n "$CMD" ] && [ "$ARGS" = "array" ] && [ "$KEPT" = "1" ] && [ "$TYPE" = "$WANT_TYPE" ]; then
+    ok "$NAME: $KEY.remynd correct${WANT_TYPE:+ (type=$WANT_TYPE)}, existing keys kept"
   else
-    bad "$NAME: command='$CMD' argsType='$ARGS' existingKept='$KEPT'"
+    bad "$NAME: command='$CMD' args='$ARGS' kept='$KEPT' type='$TYPE' (wanted '$WANT_TYPE')"
   fi
 done
 rm -rf "$CHK"

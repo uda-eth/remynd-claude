@@ -244,7 +244,7 @@ fi
 # touched and left alone entirely if it is not valid JSON.
 # ---------------------------------------------------------------------------
 add_mcp_client() {
-  local label="$1" cfg="$2" key="$3"
+  local label="$1" cfg="$2" key="$3" kind="${4:-}"
   [ "$HAVE_MCP" = "1" ] || return 0
   [ -d "$(dirname "$cfg")" ] || return 0
 
@@ -262,7 +262,9 @@ add_mcp_client() {
     SELECT json_set(
              json_set(j, '\$.$key', json(COALESCE(json_extract(j, '\$.$key'), '{}'))),
              '\$.$key.remynd',
-             json_object('command', '$BIN_DIR/remynd-mcp', 'args', json_array())
+             $( [ -n "$kind" ] \
+                && printf "json_object('type','%s','command','%s','args',json_array())" "$kind" "$BIN_DIR/remynd-mcp" \
+                || printf "json_object('command','%s','args',json_array())" "$BIN_DIR/remynd-mcp" )
            ) FROM s;" 2>/dev/null)"
 
   if [ -n "$merged" ] && /usr/bin/sqlite3 :memory: "SELECT json_valid('$(printf '%s' "$merged" | /usr/bin/sed "s/'/''/g")');" 2>/dev/null | grep -q '^1$'; then
@@ -277,6 +279,9 @@ add_mcp_client() {
 add_mcp_client "Claude Desktop" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" "mcpServers"
 add_mcp_client "Cursor"         "$HOME/.cursor/mcp.json"                                              "mcpServers"
 add_mcp_client "Gemini CLI"     "$HOME/.gemini/settings.json"                                         "mcpServers"
+# VS Code differs on both counts: the object is called `servers`, not
+# `mcpServers`, and a local server must declare "type": "stdio".
+add_mcp_client "VS Code"        "$HOME/Library/Application Support/Code/User/mcp.json"                "servers" "stdio"
 
 # ---------------------------------------------------------------------------
 # 5. Codex — AGENTS.md block + the remynd CLI
@@ -327,6 +332,19 @@ Credential-shaped strings appear as `<redacted>`; that is the redaction working.
 <!-- remynd:end -->
 BLOCK
   ok "Codex: ReMynd block added to ~/.codex/AGENTS.md"
+
+  # Codex speaks MCP natively and keeps its servers in config.toml. The
+  # AGENTS.md block above teaches it the CLI, which works, but registering the
+  # server gives it real tools instead of shell instructions.
+  if [ "$HAVE_MCP" = "1" ]; then
+    CODEX_TOML="$CODEX_DIR/config.toml"
+    if [ -f "$CODEX_TOML" ] && grep -q '^\[mcp_servers\.remynd\]' "$CODEX_TOML" 2>/dev/null; then
+      ok "Codex: MCP server already registered"
+    else
+      printf '\n[mcp_servers.remynd]\ncommand = "%s"\n' "$BIN_DIR/remynd-mcp" >> "$CODEX_TOML"
+      ok "Codex: registered as an MCP server in config.toml"
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------------------------
