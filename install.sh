@@ -244,9 +244,20 @@ fi
 # touched and left alone entirely if it is not valid JSON.
 # ---------------------------------------------------------------------------
 add_mcp_client() {
-  local label="$1" cfg="$2" key="$3" kind="${4:-}"
+  local label="$1" cfg="$2" key="$3" kind="${4:-}" app="${5:-}"
   [ "$HAVE_MCP" = "1" ] || return 0
-  [ -d "$(dirname "$cfg")" ] || return 0
+
+  # Create the config directory when the app is installed but has never been
+  # launched. VS Code does not create ~/Library/Application Support/Code/User
+  # until first run, so requiring it meant a freshly installed VS Code was
+  # silently skipped — the exact case of someone setting up a new machine.
+  if [ ! -d "$(dirname "$cfg")" ]; then
+    if [ -n "$app" ] && [ -d "$app" ]; then
+      mkdir -p "$(dirname "$cfg")" 2>/dev/null || return 0
+    else
+      return 0
+    fi
+  fi
 
   [ -f "$cfg" ] || echo '{}' > "$cfg"
   if ! /usr/bin/sqlite3 :memory: "SELECT json_valid(readfile('$cfg'));" 2>/dev/null | grep -q '^1$'; then
@@ -276,12 +287,12 @@ add_mcp_client() {
   fi
 }
 
-add_mcp_client "Claude Desktop" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" "mcpServers"
-add_mcp_client "Cursor"         "$HOME/.cursor/mcp.json"                                              "mcpServers"
+add_mcp_client "Claude Desktop" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" "mcpServers" "" "/Applications/Claude.app"
+add_mcp_client "Cursor"         "$HOME/.cursor/mcp.json"                                              "mcpServers" "" "/Applications/Cursor.app"
 add_mcp_client "Gemini CLI"     "$HOME/.gemini/settings.json"                                         "mcpServers"
 # VS Code differs on both counts: the object is called `servers`, not
 # `mcpServers`, and a local server must declare "type": "stdio".
-add_mcp_client "VS Code"        "$HOME/Library/Application Support/Code/User/mcp.json"                "servers" "stdio"
+add_mcp_client "VS Code"        "$HOME/Library/Application Support/Code/User/mcp.json"                "servers" "stdio" "/Applications/Visual Studio Code.app"
 
 # ---------------------------------------------------------------------------
 # 5. Codex — AGENTS.md block + the remynd CLI
