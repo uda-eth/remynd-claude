@@ -490,6 +490,29 @@ final class HTTPTransport {
         let method = parts.first ?? ""
         let path = parts.count > 1 ? parts[1] : "/"
 
+        let route = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
+
+        // OAuth discovery, answered BEFORE the auth check.
+        //
+        // ChatGPT probes /.well-known/oauth-* to work out how to authenticate.
+        // Returning 401 there tells it "auth is required but I won't say how",
+        // and it gives up. A clean 404 lets discovery conclude there is no
+        // OAuth to negotiate, which is correct: this endpoint authenticates by
+        // the token embedded in its URL. ChatGPT does not accept Bearer
+        // headers, so the URL is the only channel available.
+        if route.hasPrefix("/.well-known/") {
+            send(conn, status: "404 Not Found",
+                 json: ["error": "no OAuth metadata: this endpoint authenticates via the token in its URL"])
+            return
+        }
+
+        // CORS preflight, also before auth — a browser-based client will send
+        // OPTIONS with no credentials and must not be met with a 401.
+        if method == "OPTIONS" {
+            send(conn, status: "204 No Content", json: nil)
+            return
+        }
+
         // 1. Origin validation — MUST, per spec. A browser page on any origin
         //    can POST to localhost; without this it could read the user's
         //    entire screen history.
@@ -512,14 +535,13 @@ final class HTTPTransport {
             let queryAuth = Self.queryValue("auth", in: path)
             guard headerAuth == "Bearer \(token)" || queryAuth == token else {
                 send(conn, status: "401 Unauthorized",
-                     json: ["jsonrpc": "2.0", "error": ["code": -32600, "message": "Unauthorized"]])
+                     json: ["jsonrpc": "2.0", "error": ["code": -32600, "message": "Unauthorized"]],
+                     extraHeaders: ["WWW-Authenticate": "Bearer realm=\"remynd\", error=\"invalid_token\""])
                 return
             }
         }
 
         // Health check, so a tunnel or the app can probe without speaking MCP.
-        let route = path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? path
-
         if method == "GET" && route.hasPrefix("/health") {
             send(conn, status: "200 OK", json: ["ok": true, "server": SERVER_NAME, "version": SERVER_VERSION])
             return
@@ -591,8 +613,14 @@ final class HTTPTransport {
         data.range(of: needle.data(using: .utf8)!)
     }
 
-    private func send(_ conn: NWConnection, status: String, json: Any?) {
+    private func send(_ conn: NWConnection, status: String, json: Any?,
+                      extraHeaders: [String: String] = [:]) {
         var head = "HTTP/1.1 \(status)\r\n"
+        for (k, v) in extraHeaders { head += "\(k): \(v)\r\n" }
+        // A browser-based client needs these to talk to the endpoint at all.
+        head += "Access-Control-Allow-Origin: *\r\n"
+        head += "Access-Control-Allow-Headers: Content-Type, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name\r\n"
+        head += "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
         var bodyData = Data()
         if let json {
             bodyData = jsonString(json).data(using: .utf8) ?? Data()
