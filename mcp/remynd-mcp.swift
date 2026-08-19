@@ -56,6 +56,15 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
 
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+
+    // Clients launch an MCP server with a minimal environment — Claude Desktop
+    // passes no LANG at all. Window titles and OCR text are full of multibyte
+    // characters, and under the C locale the text pipeline cannot decode them
+    // and produces nothing. That presented as "reconstruct_day returns no
+    // results" while the identical command worked from a terminal.
+    if env["LC_ALL"] == nil && env["LANG"] == nil {
+        env["LANG"] = "en_US.UTF-8"
+    }
     p.environment = env
 
     let pipe = Pipe()

@@ -10,6 +10,19 @@
 # Everything here is READ-ONLY with respect to ReMynd's data.
 # ---------------------------------------------------------------------------
 
+# A UTF-8 locale is not optional here.
+#
+# Window titles and OCR text are full of multibyte characters — spinner glyphs,
+# em-dashes, arrows — and the title normaliser matches on them. Under the C
+# locale awk cannot decode them and the whole pipeline collapses, silently.
+# Callers that launch this from a GUI give it almost no environment: an MCP
+# client passes no LANG at all, and the result was `remynd day` returning
+# nothing at all while working perfectly from a terminal. Set it ourselves
+# rather than hoping the caller did.
+if [ -z "${LANG:-}" ] && [ -z "${LC_ALL:-}" ]; then
+  export LANG="en_US.UTF-8"
+fi
+
 REMYND_STATE_DIR="${REMYND_STATE_DIR:-$HOME/.remynd-sync}"
 REMYND_SQLITE="${REMYND_SQLITE:-/usr/bin/sqlite3}"
 [ -x "$REMYND_SQLITE" ] || REMYND_SQLITE="$(command -v sqlite3 2>/dev/null || echo /usr/bin/sqlite3)"
