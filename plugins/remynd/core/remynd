@@ -176,9 +176,9 @@ cmd_text() {
       if (k in seen) next
       seen[k] = 1
       t = $2; if (t == "") next
+      if (doredact == 1) t = redact(t)
       if (t in shown) next
       shown[t] = 1
-      if (doredact == 1) t = redact(t)
       printf "%s  %s\n", substr($1, 12, 8), t }
     END { if (NR == 0) print "(nothing recorded in that range)" }'
 }

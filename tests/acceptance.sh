@@ -61,7 +61,10 @@ if [ -s "$D" ]; then
   grep -q '^  > ' "$D" && ok "delta contains verbatim OCR lines" || bad "delta has no OCR body text"
   T=$(( $(wc -c < "$D") / 4 ))
   [ "$T" -le 6000 ] && ok "delta ${T} tokens, within the 6000 cap" || bad "delta ${T} tokens exceeds cap"
-  DUP="$(grep '^  > ' "$D" | sort | uniq -d | wc -l | tr -d ' ')"
+  # LC_ALL=C is load-bearing: locale collation groups non-identical multi-byte
+  # strings (two OCR captures of one title truncated at different widths look
+  # "equal" to a locale-aware sort), which reports duplicates that don't exist.
+  DUP="$(grep '^  > ' "$D" | LC_ALL=C sort | LC_ALL=C uniq -d | wc -l | tr -d ' ')"
   [ "$DUP" = "0" ] && ok "no duplicate lines (dedupe working)" || bad "$DUP duplicated lines survived dedupe"
 else
   bad "delta was empty for a 400-segment window"

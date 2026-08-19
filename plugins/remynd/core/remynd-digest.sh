@@ -194,11 +194,14 @@ remynd_ocr_since() {
       if (key in seen) next
       seen[key] = 1
 
+      # Redact FIRST, then dedupe on the text as it will actually be
+      # delivered. Deduping on the raw text lets two rows that differ only in
+      # a redacted secret both through, printing the same line twice.
       text = $3
       if (text == "") next
+      if (doredact == 1) text = redact(text)
       if (text in shown) next
       shown[text] = 1
-      if (doredact == 1) text = redact(text)
 
       # Budget: stop emitting body text, keep counting what we deferred.
       if (truncated) { deferred++; next }
@@ -357,11 +360,14 @@ remynd_ocr_since_id() {
       key = $4; if (key == "") key = $3
       if (key in seen) next
       seen[key] = 1
+      # Redact FIRST, then dedupe on the text as it will actually be
+      # delivered. Deduping on the raw text lets two rows that differ only in
+      # a redacted secret both through, printing the same line twice.
       text = $3
       if (text == "") next
+      if (doredact == 1) text = redact(text)
       if (text in shown) next
       shown[text] = 1
-      if (doredact == 1) text = redact(text)
       if (truncated) { deferred++; next }
       if ((chars + length(text)) / 4 > budget) { truncated = 1; deferred++; next }
       if (app != lastapp) {
