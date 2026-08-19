@@ -47,13 +47,22 @@ can use your history too.
 **Same-machine clients** — Claude Desktop, Cursor, VS Code, Gemini CLI — are wired up by the
 installer. Restart the app and ask it what you did yesterday.
 
-**Off-device agents** — ChatGPT, or an assistant that texts you — need a public HTTPS endpoint:
+**Off-device agents** — ChatGPT, or an assistant that texts you — cannot reach a server on your
+Mac, so they need a public HTTPS endpoint:
 
 ```bash
 remynd-remote start     # prints a connector URL to paste in
 remynd-remote rotate    # mint a new token; every old URL dies
 remynd-remote stop
 ```
+
+Paste the printed URL into ChatGPT under **Settings → Connectors → Add custom connector**.
+
+> **ChatGPT needs a paid plan for this.** Custom connectors are a Plus / Pro / Business /
+> Enterprise / Edu feature — on a Free account the Connectors section does not exist, and there is
+> nowhere to paste the URL. This is OpenAI's gate, not ReMynd's: the endpoint itself is ready, and
+> answers ChatGPT's connector contract exactly (`search` and `fetch`, `structuredContent`, no
+> Bearer header required). Everything else on this page works on any plan.
 
 The endpoint runs on your Mac and is published through **your own tunnel on your own account**.
 ReMynd operates no relay and keeps no copy — we are not in the path. That does change the sentence

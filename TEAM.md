@@ -49,8 +49,11 @@ To hold something back, add app names or domains to `sync_exclude` in the config
 - **Claude Desktop** works well; try it first.
 - **Claude Code** gets a richer setup: context arrives every session, no tool call needed.
 - **Cursor / Gemini CLI / Codex** are wired but less exercised.
-- **ChatGPT** needs a public endpoint: `remynd-remote start` publishes one through *your
-  own* Cloudflare tunnel and prints a URL. Requires `cloudflared`.
+- **ChatGPT** needs two things: a public endpoint (`remynd-remote start` publishes one through
+  *your own* Cloudflare tunnel and prints a URL; requires `cloudflared`) **and a paid ChatGPT
+  plan**. Custom connectors are Plus / Pro / Business / Enterprise / Edu only — on Free there is
+  no Connectors section to paste the URL into. The server side is done and verified against
+  ChatGPT's contract; the plan is the only thing in the way.
 - **The in-app setup button** is built but not shipped (open PR), so use the command above.
 - **If ReMynd itself will not launch**, there is an open production crash on startup
   (`SandboxCustomAppBridge.listCalls`) unrelated to this. Flag it rather than fighting it.
