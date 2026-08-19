@@ -196,10 +196,12 @@ case "${1:-}" in
     ;;
 esac
 
+# Only mention the terminal agents here. MCP clients (Claude Desktop, Cursor,
+# Gemini CLI) are detected separately further down, and saying "no agent to wire
+# up" before wiring up Claude Desktop reads as a contradiction to the very
+# common case of someone who only has the desktop app.
 if [ "$WANT_CLAUDE" -eq 0 ] && [ "$WANT_CODEX" -eq 0 ]; then
-  warn "Neither ~/.claude nor ~/.codex found — no agent to wire up."
-  warn "Install Claude Code (https://claude.com/claude-code) or Codex, then re-run."
-  warn "The 'remynd' command still works: $BIN_DIR/remynd"
+  say "No terminal agent found (Claude Code, Codex) — checking desktop apps instead."
 fi
 
 # ---------------------------------------------------------------------------
