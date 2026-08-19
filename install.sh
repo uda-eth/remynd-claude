@@ -118,6 +118,12 @@ context_window_tokens=200000
 delta_cap_tokens=6000
 min_delta_tokens=50
 
+# Your coding agent's own terminal UI gets recorded like everything else, and
+# feeding it back is a mirror: the assistant re-reads its own previous answers,
+# OCR'd and line-wrapped. It already has that conversation, so this is skipped
+# by default. Set to 0 to include it.
+exclude_agent_ui=1
+
 # Apps and domains that ReMynd records but that must never reach your agent.
 # Comma-separated, case-insensitive, matched against the focused app name.
 # Empty means everything is sent, which is the default.

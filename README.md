@@ -76,6 +76,11 @@ everything.
 **What ReMynd never recorded can't appear.** Incognito browser windows are excluded by ReMynd itself
 unless you opted in, and anything captured while recording was paused simply doesn't exist.
 
+**Your agent's own terminal is skipped.** ReMynd records the screen, and the screen includes Claude
+Code itself. Feeding that back would have the assistant re-reading its own answers through OCR — on a
+real session that was 88% of the payload. It's skipped by default (`exclude_agent_ui=0` to include
+it), and the digest says how many lines it left out.
+
 **You can carve out more.** ReMynd has no per-app capture exclusion, so this ships its own:
 `sync_exclude` in the config takes app names and domains that are recorded but never sent. It's empty
 by default.

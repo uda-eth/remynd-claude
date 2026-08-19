@@ -81,6 +81,34 @@ remynd_exclude_pattern() {
     /usr/bin/awk '{ gsub(/[ \t]*,[ \t]*/, ","); print tolower($0) }'
 }
 
+
+# ---------------------------------------------------------------------------
+# Agent self-capture (exclude_agent_ui)
+#
+# ReMynd records the screen, and the screen includes the coding agent's own
+# terminal UI. Feeding that back is a mirror: the assistant re-reads its own
+# previous answers, OCR'd and line-wrapped, as if it were new information about
+# the user. Measured on one real delta: 593 OCR lines, of which 84 echoed the
+# assistant's own prior output and 31 were TUI chrome.
+#
+# It is also pure waste — the agent already holds that conversation verbatim
+# and losslessly, so dropping the OCR of it loses nothing at all.
+#
+# Detection: a terminal emulator whose window title marks it as an agent
+# session. Structural lines (app, title, timing) are kept; only the OCR body
+# text of those windows is dropped.
+# ---------------------------------------------------------------------------
+_remynd_agentui_awk() {
+  cat <<'AWK'
+function is_agent_ui(a, t) {
+  if (skip_agent != 1) return 0
+  if (a !~ /Terminal|iTerm|Ghostty|Alacritty|WezTerm|kitty|Warp|Hyper/) return 0
+  if (t ~ /[Cc]laude|[Cc]odex|[Aa]ider|[Cc]ursor-agent/) return 1
+  return 0
+}
+AWK
+}
+
 # ---------------------------------------------------------------------------
 # Structural layer: where the user was.
 # ---------------------------------------------------------------------------
@@ -163,8 +191,8 @@ remynd_ocr_since() {
 
   # Window timeline first (small), then OCR (large). awk merges them.
   { remynd_sql "$db" "
-      SELECT 'W', datetime(startedAt,'localtime'), applicationName
-      FROM (SELECT id, startedAt, applicationName
+      SELECT 'W', datetime(startedAt,'localtime'), applicationName, COALESCE(windowTitle,'')
+      FROM (SELECT id, startedAt, applicationName, windowTitle
             FROM FocusedWindow ORDER BY id DESC LIMIT $REMYND_WIN_TAIL)
       WHERE startedAt >= '$since' AND applicationName IS NOT NULL
       ORDER BY startedAt ASC;"
@@ -176,15 +204,19 @@ remynd_ocr_since() {
       ORDER BY firstSeenAt ASC;"
   } | LC_ALL=C /usr/bin/sort -t"$REMYND_FS" -k2,2 -s |
   /usr/bin/awk -F"$REMYND_FS" -v budget="$budget_tokens" -v doredact="$redact" \
-                -v excl="$(remynd_exclude_pattern)" '
+                -v excl="$(remynd_exclude_pattern)" \
+                -v skip_agent="$(remynd_config_get exclude_agent_ui 1)" '
 '"$(_remynd_redact_awk)"'
 '"$(_remynd_exclude_awk)"'
-    BEGIN { chars = 0; app = ""; lastapp = ""; truncated = 0; deferred = 0; excluded = 0
+'"$(_remynd_agentui_awk)"'
+    BEGIN { chars = 0; app = ""; wtitle = ""; lastapp = ""; truncated = 0
+            deferred = 0; excluded = 0; selfcap = 0
             n_ex = split(excl, ex_list, ",") }
     {
-      if ($1 == "W") { app = $3; next }
+      if ($1 == "W") { app = $3; wtitle = $4; next }
       if ($1 != "O") next
       if (is_excluded(app)) { excluded++; next }
+      if (is_agent_ui(app, wtitle)) { selfcap++; next }
 
       # Dedupe on normalizedText AND on the rendered text. The recorder can
       # produce two rows whose normalizedText differs by a spinner glyph or a
@@ -220,6 +252,8 @@ remynd_ocr_since() {
         printf "\n  …%d more captured lines in this window — ask /remynd for the full text\n", deferred
       if (excluded > 0)
         printf "\n  (%d lines withheld by your sync_exclude setting)\n", excluded
+      if (selfcap > 0)
+        printf "\n  (%d lines skipped: your coding agent UI, which the agent already has)\n", selfcap
     }
   '
 }
@@ -348,7 +382,7 @@ remynd_ocr_since_id() {
   local db="$1" last_ocr="$2" last_win="$3" budget_tokens="${4:-6000}" redact="${5:-1}"
 
   { remynd_sql "$db" "
-      SELECT 'W', datetime(startedAt,'localtime'), applicationName FROM FocusedWindow
+      SELECT 'W', datetime(startedAt,'localtime'), applicationName, COALESCE(windowTitle,'') FROM FocusedWindow
       WHERE id > $last_win AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
       ORDER BY id ASC;"
     remynd_sql "$db" "
@@ -356,15 +390,19 @@ remynd_ocr_since_id() {
       FROM OCRTextSegment WHERE id > $last_ocr ORDER BY id ASC;"
   } | LC_ALL=C /usr/bin/sort -t"$REMYND_FS" -k2,2 -s |
   /usr/bin/awk -F"$REMYND_FS" -v budget="$budget_tokens" -v doredact="$redact" \
-                -v excl="$(remynd_exclude_pattern)" '
+                -v excl="$(remynd_exclude_pattern)" \
+                -v skip_agent="$(remynd_config_get exclude_agent_ui 1)" '
 '"$(_remynd_redact_awk)"'
 '"$(_remynd_exclude_awk)"'
-    BEGIN { chars = 0; app = ""; lastapp = ""; truncated = 0; deferred = 0; excluded = 0
+'"$(_remynd_agentui_awk)"'
+    BEGIN { chars = 0; app = ""; wtitle = ""; lastapp = ""; truncated = 0
+            deferred = 0; excluded = 0; selfcap = 0
             n_ex = split(excl, ex_list, ",") }
     {
-      if ($1 == "W") { app = $3; next }
+      if ($1 == "W") { app = $3; wtitle = $4; next }
       if ($1 != "O") next
       if (is_excluded(app)) { excluded++; next }
+      if (is_agent_ui(app, wtitle)) { selfcap++; next }
       key = $4; if (key == "") key = $3
       if (key in seen) next
       seen[key] = 1
@@ -390,6 +428,8 @@ remynd_ocr_since_id() {
         printf "\n  …%d more captured lines — ask /remynd for the full text\n", deferred
       if (excluded > 0)
         printf "\n  (%d lines withheld by your sync_exclude setting)\n", excluded
+      if (selfcap > 0)
+        printf "\n  (%d lines skipped: your coding agent UI, which the agent already has)\n", selfcap
     }
   '
 }

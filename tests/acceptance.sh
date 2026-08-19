@@ -226,6 +226,23 @@ fi
 rm -rf "$LINKDIR"
 
 # ---------------------------------------------------------------------------
+head_ "Extra — the agent's own terminal UI is not fed back to it"
+AGD_OFF="$(mktemp -d)"; AGD_ON="$(mktemp -d)"
+cp "$REMYND_STATE_DIR/config" "$AGD_OFF/config"; cp "$REMYND_STATE_DIR/config" "$AGD_ON/config"
+echo "exclude_agent_ui=0" >> "$AGD_OFF/config"; echo "exclude_agent_ui=1" >> "$AGD_ON/config"
+OFFN="$(REMYND_STATE_DIR="$AGD_OFF" bash -c ". \"$CORE/remynd-digest.sh\"; remynd_ocr_since_id \"$DB\" $((MAXO-2500)) $((MAXW-120)) 6000 1" | grep -c '^  > ')"
+ONOUT="$(REMYND_STATE_DIR="$AGD_ON" bash -c ". \"$CORE/remynd-digest.sh\"; remynd_ocr_since_id \"$DB\" $((MAXO-2500)) $((MAXW-120)) 6000 1")"
+ONN="$(printf '%s' "$ONOUT" | grep -c '^  > ')"
+if [ "$OFFN" -gt "$ONN" ]; then
+  ok "agent UI text dropped ($OFFN -> $ONN lines)"
+  printf '%s' "$ONOUT" | grep -q 'coding agent UI' && ok "says how many lines it skipped" || bad "skipped silently"
+elif [ "$OFFN" -eq 0 ]; then
+  ok "skipped: no OCR in range"
+else
+  bad "filter had no effect ($OFFN -> $ONN)"
+fi
+rm -rf "$AGD_OFF" "$AGD_ON"
+
 head_ "Extra — sync_exclude withholds, and says that it did"
 # Assert on the right thing: excluding an app frees budget, so the TOTAL line
 # count can legitimately go UP as other apps' text fills the space. What must
