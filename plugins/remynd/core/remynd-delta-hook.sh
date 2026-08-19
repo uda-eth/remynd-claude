@@ -18,7 +18,13 @@ _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_here/remynd-digest.sh" 2>/dev/null || exit 0
 
 # The hook payload carries session_id. Extract it without jq.
-payload="$(cat 2>/dev/null || true)"
+#
+# Read with a timeout rather than a bare `cat`: if the caller never closes the
+# pipe, an unconditional read blocks forever and the user's prompt hangs behind
+# it. Two seconds is far more than a hook payload ever needs, and on timeout we
+# simply fall back to the environment.
+payload=""
+IFS= read -r -t 2 -d '' payload 2>/dev/null || true
 sid="$(printf '%s' "$payload" | /usr/bin/sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
 [ -n "$sid" ] || sid="${CLAUDE_SESSION_ID:-default}"
 

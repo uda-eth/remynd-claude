@@ -14,7 +14,9 @@ set -u
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_here/remynd-digest.sh" 2>/dev/null || exit 0
 
-cat >/dev/null 2>&1   # drain the hook payload on stdin; we don't need it here
+# NOTE: do not read stdin here. An unconditional `cat` blocks forever if the
+# caller never closes the pipe, which would hang the user's session before it
+# starts. This hook needs nothing from the payload, so it reads nothing.
 
 [ "$(remynd_config_get enabled 1)" = "1" ] || exit 0
 

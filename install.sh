@@ -93,6 +93,12 @@ if [ ! -f "$SYNC_DIR/config" ]; then
 
 enabled=1
 
+# Which ReMynd data to read. Blank means auto-detect, preferring the
+# production app over a development build. Set an absolute profile path to pin
+# it — useful if you run a dev build and want that one instead.
+#   profile=/Users/you/Library/Application Support/Move37/ReMynd-<id>
+profile=
+
 # Credential-shaped strings (API keys, tokens, card numbers, password= lines)
 # are replaced before anything is sent to your agent. Set to 0 to send
 # absolutely everything untouched.

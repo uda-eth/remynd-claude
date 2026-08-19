@@ -135,12 +135,26 @@ done
 
 # ---------------------------------------------------------------------------
 head_ "AC7 — nothing is ever written to ReMynd's data"
-before="$(stat -f '%m %z' "$DB")"
-bash "$CORE/remynd-refresh.sh" --force >/dev/null 2>&1
-echo '{"session_id":"ro"}' | bash "$CORE/remynd-delta-hook.sh" >/dev/null 2>&1
-after="$(stat -f '%m %z' "$DB")"
-[ "$before" = "$after" ] && ok "app.db unchanged (mtime + size)" || bad "app.db was modified!"
-grep -rq 'mode=ro' "$CORE/remynd-lib.sh" && ok "database opened read-only" || bad "no mode=ro found"
+# Must be checked against a database nobody else is writing to: on a live
+# profile the recorder changes mtime on its own and the assertion would fail
+# for reasons that have nothing to do with us.
+RO_DB="$IDLE_DB"; RO_NOTE="$IDLE_NOTE"
+before="$(stat -f '%m %z' "$RO_DB")"
+REMYND_PROFILE="${FROZEN:-$PROFILE}" bash "$CORE/remynd-refresh.sh" --force >/dev/null 2>&1
+echo '{"session_id":"ro"}' | REMYND_PROFILE="${FROZEN:-$PROFILE}" bash "$CORE/remynd-delta-hook.sh" >/dev/null 2>&1
+REMYND_PROFILE="${FROZEN:-$PROFILE}" bash "$CORE/remynd" search "the" 5 >/dev/null 2>&1
+after="$(stat -f '%m %z' "$RO_DB")"
+[ "$before" = "$after" ] && ok "app.db unchanged after refresh, delta and search $RO_NOTE" \
+                         || bad "app.db was modified $RO_NOTE"
+
+# Prove the connection really is read-only rather than merely well-behaved.
+if /usr/bin/sqlite3 "file:$RO_DB?mode=ro" "CREATE TABLE remynd_write_probe(x);" 2>/dev/null; then
+  bad "a write succeeded against mode=ro — the database is NOT protected"
+  /usr/bin/sqlite3 "$RO_DB" "DROP TABLE IF EXISTS remynd_write_probe;" 2>/dev/null
+else
+  ok "a write attempt against mode=ro is refused by SQLite"
+fi
+grep -rq 'mode=ro' "$CORE/remynd-lib.sh" && ok "every connection uses mode=ro" || bad "no mode=ro found"
 
 # ---------------------------------------------------------------------------
 head_ "AC8 — a machine with no ReMynd installs quietly and stays silent"
@@ -181,6 +195,59 @@ printf '%s' "$R" | grep -q 'sk-<redacted>'     && ok "OpenAI-style key redacted"
 printf '%s' "$R" | grep -q 'AKIA<redacted>'    && ok "AWS key redacted"           || bad "AWS key leaked"
 printf '%s' "$R" | grep -q 'password=<redacted>' && ok "password redacted"        || bad "password leaked"
 printf '%s' "$R" | grep -q '<card-redacted>'   && ok "card number redacted"       || bad "card number leaked"
+
+# ---------------------------------------------------------------------------
+head_ "Extra — hooks never hang, even if stdin is never closed"
+# A hook that blocks on stdin freezes the user's session. Both hooks used to
+# drain stdin with a bare `cat`, which never returns if the caller keeps the
+# pipe open. This is the regression guard.
+for h in remynd-session-hook remynd-delta-hook; do
+  ( REMYND_PROFILE=/nonexistent bash "$CORE/$h.sh" < /dev/zero >/dev/null 2>&1 & hp=$!
+    ( sleep 5; kill -9 $hp 2>/dev/null ) & wp=$!
+    if wait $hp 2>/dev/null; then kill $wp 2>/dev/null; exit 0; else kill $wp 2>/dev/null; exit 1; fi )
+  [ $? -eq 0 ] && ok "$h returns with stdin held open" || bad "$h HANGS on open stdin"
+done
+
+head_ "Extra — the CLI works through a symlink on PATH"
+# The installer puts a `remynd` symlink in ~/.remynd-sync/bin, so dirname of $0
+# is bin/, not the core/ directory holding the library. Regression test for a
+# bug that made the installed command unusable while the checkout worked fine.
+LINKDIR="$(mktemp -d)"
+ln -sf "$CORE/remynd" "$LINKDIR/remynd"
+if OUT="$("$LINKDIR/remynd" status 2>&1)"; then
+  printf '%s' "$OUT" | grep -q 'Profile:' && ok "resolves its core through a symlink" \
+                                          || bad "symlinked CLI produced: $OUT"
+else
+  bad "symlinked CLI failed: $OUT"
+fi
+rm -rf "$LINKDIR"
+
+# ---------------------------------------------------------------------------
+head_ "Extra — sync_exclude withholds, and says that it did"
+# Assert on the right thing: excluding an app frees budget, so the TOTAL line
+# count can legitimately go UP as other apps' text fills the space. What must
+# be true is that the excluded app's text is absent, and that the omission is
+# announced rather than silent.
+EXDIR="$(mktemp -d)"
+cp "$REMYND_STATE_DIR/config" "$EXDIR/config"
+CUT="$(remynd_cutoff 60)"
+BASE="$(REMYND_STATE_DIR="$REMYND_STATE_DIR" bash -c ". \"$CORE/remynd-digest.sh\"; remynd_ocr_since \"$DB\" \"$CUT\" 4000 1")"
+TOPAPP="$(printf '%s' "$BASE" | /usr/bin/awk '/^[0-9][0-9]:[0-9][0-9]  /{ $1=""; sub(/^ +/,""); print; exit }')"
+
+if [ -n "$TOPAPP" ]; then
+  echo "sync_exclude=$TOPAPP" >> "$EXDIR/config"
+  EXCL="$(REMYND_STATE_DIR="$EXDIR" bash -c ". \"$CORE/remynd-digest.sh\"; remynd_ocr_since \"$DB\" \"$CUT\" 4000 1")"
+  if printf '%s' "$EXCL" | grep -qE "^[0-9][0-9]:[0-9][0-9]  $TOPAPP$"; then
+    bad "excluded app '$TOPAPP' still appears in the digest"
+  else
+    ok "excluded app '$TOPAPP' no longer appears"
+  fi
+  printf '%s' "$EXCL" | grep -q 'withheld by your sync_exclude' \
+    && ok "says how many lines it withheld" || bad "withheld silently"
+else
+  ok "skipped: no recent OCR to filter"
+fi
+rm -rf "$EXDIR"
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

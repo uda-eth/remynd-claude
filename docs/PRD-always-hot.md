@@ -1,6 +1,6 @@
 # PRD — ReMynd × Claude Code: always-hot context
 
-**Status:** complete — awaiting sign-off (all open questions resolved except Codex ordering, §12)
+**Status:** BUILT — M1–M6 + M8 implemented and passing; 30/30 acceptance checks green (§14)
 **Owner:** Tony Udotong
 **Date:** 2026-08-19
 **Target:** ReMynd **production release** (1.2.9397 line) — not dev builds, not the brain feature branches.
@@ -345,6 +345,12 @@ Port from `design/liquid-glass-rollout`'s `ClaudeCodeSection` onto a fresh branc
 | **M7** | Proof pack | Clean-room install on a production profile; screenshots of both UI states; transcript showing context going hot mid-session *carrying OCR body text* |
 | **M8** | Codex adapter | `AGENTS.md` regeneration + `remynd-context` MCP server registered in `~/.codex/config.toml`; same core, same digest |
 
+**Delivered 2026-08-19.** M1–M6 and M8 are implemented in this repo and pass the acceptance suite
+(`tests/acceptance.sh`, 30 checks). M8 shipped as the `AGENTS.md` block plus the shared `remynd` CLI
+rather than an MCP server: Codex can run the command itself, which needs no server process and keeps
+one implementation across both agents. The MCP server remains available as a later addition if a
+pull-only surface is wanted. M7 (proof pack) is the remaining milestone.
+
 Commit and push at each milestone. PR opened, not merged.
 
 ## 9. Acceptance criteria
@@ -430,3 +436,71 @@ At the governing deduped rate of 820 tokens per active minute, a 35% budget yiel
 a 1M context and ~85 active minutes on 200k. Both clear a realistic working session before any
 deferral. (An earlier draft quoted ~4 hours / ~50 minutes; that used the raw 1,440 rate, inconsistent
 with dedup always being applied. Corrected in §5.6.)
+
+
+## 14. What the build found
+
+Implementation surfaced four things the PRD could not have known. Each is now encoded in the code
+and guarded by a test.
+
+### 14.1 `app.db` stores UTC, not local time
+
+ReMynd's own documentation says local. It is wrong. Verified 2026-08-19: a frame captured at
+10:22:30 EDT is stored as `2026-08-19 14:22:30`. Filtering a "last 30 minutes" window with a
+local-time cutoff therefore returns **nothing at all**, silently — the failure looks exactly like an
+idle user. The rule now enforced throughout: **filter in UTC, display in local**, with cutoffs from
+`date -u` and every human-facing timestamp passed through `datetime(col,'localtime')`.
+
+### 14.2 There is no index on any timestamp column
+
+`WHERE firstSeenAt >= <cutoff>` full-scans 873k rows: **3,954 ms**. Because `id` is `AUTOINCREMENT`
+and monotonic with time, bounding the rowid tail first and filtering inside that subquery costs
+**29 ms** — 136×. The delta path goes further: the watermark stores the last OCR rowid, making
+`WHERE id > <last>` a primary-key range scan. Measured **27 ms** for a typical delta and **20 ms**
+for the no-news case, against a 50 ms budget.
+
+### 14.3 A hook that reads stdin can hang the session
+
+Both hooks originally drained stdin with `cat`. That never returns if the caller holds the pipe
+open — which would freeze the user's prompt behind it. Claude Code always closes stdin, so this
+would have shipped undetected and failed only in unusual conditions. SessionStart now reads stdin
+not at all; the delta hook uses a bounded `read -t 2` and falls back to the environment. Guarded by
+a regression test.
+
+### 14.4 Redaction and exclusion both had to be built, not inherited
+
+§13.1 established that production has no per-app capture exclusion. `sync_exclude` is therefore
+implemented here — empty by default, matching case-insensitively against the focused app name, and
+**announcing what it withheld** rather than dropping quietly. Credential redaction covers OpenAI,
+Anthropic, GitHub, AWS, Slack, JWT, Bearer, Google and PEM key shapes plus card numbers and
+`password=`/`secret=`/`api_key=` assignments.
+
+### 14.5 Dedupe needed a second key
+
+Deduping on `normalizedText` alone leaves near-duplicates: the recorder emits rows whose normalized
+text differs only by a spinner glyph or cursor while the rendered text is identical. Deduping on the
+rendered text as well removes them, and loses nothing — identical display text is identical
+information.
+
+## 15. Shipped surface
+
+```
+.claude-plugin/marketplace.json      plugin marketplace manifest
+plugins/remynd/
+  .claude-plugin/plugin.json         versioned plugin
+  hooks/hooks.json                   SessionStart + UserPromptSubmit
+  skills/remynd/SKILL.md             the /remynd skill
+  core/
+    remynd                           the CLI both agents share
+    remynd-lib.sh                    profile detection, JSON, rowid search
+    remynd-digest.sh                 digest builder, budget governor, redaction
+    remynd-session-hook.sh           opening snapshot
+    remynd-delta-hook.sh             the always-hot engine
+    remynd-refresh.sh                out-of-band cache
+    remynd-settings.sh               safe settings.json merge (no jq)
+install.sh                           Claude Code and/or Codex, plus --uninstall
+tests/acceptance.sh                  30 checks against a real profile
+```
+
+Dependencies: `bash`, `/usr/bin/sqlite3`, `/usr/bin/awk`, `/usr/bin/sed`. All are system binaries on
+every supported macOS. No jq, no Homebrew, no Python, no node, no network at runtime.

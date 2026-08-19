@@ -10,8 +10,24 @@
 # ---------------------------------------------------------------------------
 set -u
 
-_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$_here/remynd-digest.sh" 2>/dev/null || { echo "remynd: core not found" >&2; exit 1; }
+# Resolve through symlinks: the installer puts a `remynd` symlink on PATH in
+# ~/.remynd-sync/bin, so dirname of $0 is bin/, not the core/ directory the
+# library lives in.
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _target="$(readlink "$_self")"
+  case "$_target" in
+    /*) _self="$_target" ;;
+    *)  _self="$(dirname "$_self")/$_target" ;;
+  esac
+done
+_here="$(cd "$(dirname "$_self")" && pwd)"
+
+. "$_here/remynd-digest.sh" 2>/dev/null || {
+  echo "remynd: could not load its core from $_here" >&2
+  echo "  Reinstall with: bash <(curl -fsSL https://remyndai.com/claude/install.sh)" >&2
+  exit 1
+}
 
 die() { printf 'remynd: %s\n' "$*" >&2; exit 1; }
 

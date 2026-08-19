@@ -27,8 +27,13 @@ REMYND_FS=$'\037'
 # that left the previous integration emitting zero bytes.
 # ---------------------------------------------------------------------------
 remynd_find_profile() {
-  if [ -n "${REMYND_PROFILE:-}" ]; then
-    [ -f "$REMYND_PROFILE/Recordings/app.db" ] && { printf '%s\n' "$REMYND_PROFILE"; return 0; }
+  # Explicit override wins: the REMYND_PROFILE env var first, then a
+  # `profile=` line in the config. Useful when a machine has both a
+  # production and a development ReMynd and you want to pin one.
+  local override="${REMYND_PROFILE:-}"
+  [ -n "$override" ] || override="$(remynd_config_get profile "")"
+  if [ -n "$override" ]; then
+    [ -f "$override/Recordings/app.db" ] && { printf '%s\n' "$override"; return 0; }
     return 1
   fi
 
