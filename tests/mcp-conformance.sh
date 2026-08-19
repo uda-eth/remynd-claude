@@ -140,6 +140,59 @@ elif [ "${LEN:-0}" -le 30000 ]; then ok "a whole-day request is capped (${LEN} c
 else bad "result is ${LEN} chars — clients reject payloads this size"; fi
 
 # ---------------------------------------------------------------------------
+hd "ChatGPT's connector contract"
+# ChatGPT will register any MCP server, but its default connector path looks
+# for `search` and `fetch` by name and expects a fixed result shape. A server
+# with only its own tool names works in developer mode and nowhere else.
+NAMES="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | tail -1 \
+  | /usr/bin/python3 -c 'import json,sys; print(" ".join(t["name"] for t in json.load(sys.stdin)["result"]["tools"]))' 2>/dev/null)"
+for T in search fetch; do
+  case " $NAMES " in *" $T "*) ok "exposes a tool named $T" ;;
+                     *) bad "no $T tool — ChatGPT's default connector path cannot use this server" ;; esac
+done
+
+SR="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"the"}}}')"
+FIRST_ID="$(printf '%s' "$SR" | /usr/bin/python3 -c '
+import json,sys
+try:
+    r=json.load(sys.stdin)["result"]; sc=r["structuredContent"]; rows=sc["results"]
+    assert rows, "empty"
+    for x in rows:
+        for k in ("id","title","url"):
+            assert isinstance(x.get(k),str) and x[k], "row missing "+k
+    assert json.loads(r["content"][0]["text"])["results"][0]["id"]==rows[0]["id"], "content/structured mismatch"
+    print(rows[0]["id"])
+except Exception as e:
+    print("ERR:"+str(e))' 2>/dev/null)"
+case "$FIRST_ID" in
+  ERR:*|"") bad "search result shape: ${FIRST_ID:-no result}" ;;
+  *) ok "search returns {id,title,url} rows in structuredContent, mirrored in content" ;;
+esac
+
+# ChatGPT hands the id back in several forms depending on where it came from.
+if [ -n "$FIRST_ID" ] && [ "${FIRST_ID#ERR:}" = "$FIRST_ID" ]; then
+  ENC="$(/usr/bin/python3 -c 'import urllib.parse,sys; print(urllib.parse.quote("remynd://moment/"+sys.argv[1], safe=""))' "$FIRST_ID")"
+  for FORM in "$FIRST_ID" "remynd://moment/$FIRST_ID" "$ENC"; do
+    R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"fetch\",\"arguments\":{\"id\":\"$FORM\"}}}")"
+    V="$(printf '%s' "$R" | /usr/bin/python3 -c '
+import json,sys
+try:
+    r=json.load(sys.stdin)["result"]; sc=r["structuredContent"]
+    for k in ("id","title","text","url"):
+        assert isinstance(sc.get(k),str) and sc[k], "missing "+k
+    # Truncating the ENCODED json leaves it unparseable; capping only the
+    # encoded copy leaves structuredContent oversized. Both must hold.
+    assert json.loads(r["content"][0]["text"])["id"]==sc["id"], "content is not the same object"
+    assert len(sc["text"]) <= 24000, "structuredContent.text is %d chars" % len(sc["text"])
+    print("ok")
+except Exception as e: print("ERR:"+str(e))' 2>/dev/null)"
+    LABEL="$(printf '%s' "$FORM" | cut -c1-28)"
+    [ "$V" = ok ] && ok "fetch accepts id as '${LABEL}…' and returns a valid capped document" \
+                  || bad "fetch('${LABEL}…'): ${V:-no result}"
+  done
+fi
+
+# ---------------------------------------------------------------------------
 hd "Config schemas match what each client documents"
 # Verified against the clients' own docs: Gemini CLI reads a top-level
 # mcpServers object in ~/.gemini/settings.json; Cursor uses the same shape as

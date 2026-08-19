@@ -140,6 +140,16 @@ struct Tool {
     let description: String
     let schema: [String: Any]
     let run: ([String: Any]) -> (String, Bool)
+
+    /// Optional: a result in ChatGPT's connector shape.
+    ///
+    /// Most tools answer with prose, which every client renders. ChatGPT's
+    /// connector contract is stricter for `search` and `fetch` — it wants
+    /// `structuredContent` with named fields, and it only turns a result into
+    /// a citation when that result carries a non-empty `url`. A tool that sets
+    /// this gets both: the structured object AND the same object JSON-encoded
+    /// in the text content, which is what OpenAI's own reference servers emit.
+    var structured: (([String: Any]) -> [String: Any]?)? = nil
 }
 
 /// Reads a string argument, accepting common aliases.
@@ -158,6 +168,125 @@ func int(_ args: [String: Any], _ key: String) -> Int? {
     if let d = args[key] as? Double { return Int(d) }
     if let s = args[key] as? String { return Int(s) }
     return nil
+}
+
+
+// ---------------------------------------------------------------------------
+// ChatGPT's connector contract
+//
+// ChatGPT will register any MCP server, but its default connector path looks
+// for two tools by name — `search` and `fetch` — with a fixed result shape:
+// search returns {id, title, url} rows, fetch turns one of those ids back into
+// {id, title, text, url}. Servers that expose only their own tool names work
+// in developer mode and nowhere else.
+//
+// So ReMynd exposes both. They are a thin shell over the same screen history
+// the named tools read; the unit of a "result" is one focused window, because
+// a word that sat on screen for ten minutes matches hundreds of OCR rows
+// inside a single window and returning those as hundreds of documents is
+// noise.
+//
+// On `url`: there are no web URLs to cite here — this is screen history, not
+// a document store, and the browser-visit table is empty on a normal install.
+// The id is minted as a remynd:// deep link instead. ReMynd registers that
+// scheme, so the link is well-formed and stable, and ChatGPT will cite it.
+// ---------------------------------------------------------------------------
+
+private let momentDateOut: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "EEE d MMM, HH:mm"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+private let momentDateIn: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
+/// `2026-08-19 19:01:24` <-> `2026-08-19T19:01:24`. The id travels through JSON
+/// and back; keeping it free of spaces keeps it usable in a URL path too.
+func momentID(fromTimestamp ts: String) -> String { ts.replacingOccurrences(of: " ", with: "T") }
+func momentTimestamp(fromID id: String) -> String {
+    // Decode first, then strip: ChatGPT may hand the url back percent-encoded,
+    // in which case the scheme prefix is unrecognisable until it is decoded.
+    var t = id.removingPercentEncoding ?? id
+    if let r = t.range(of: "remynd://moment/") { t.removeSubrange(t.startIndex..<r.upperBound) }
+    t = t.replacingOccurrences(of: "T", with: " ")
+    // Accept a bare minute; the CLI wants seconds.
+    let parts = t.split(separator: ":")
+    if parts.count == 2 { t += ":00" }
+    return t.trimmingCharacters(in: .whitespaces)
+}
+
+func momentTitle(app: String, window: String, timestamp: String) -> String {
+    let when = momentDateIn.date(from: timestamp).map { momentDateOut.string(from: $0) } ?? timestamp
+    let what = window.isEmpty ? app : (app.isEmpty ? window : "\(app) — \(window)")
+    return what.isEmpty ? "Screen at \(when)" : "\(what) · \(when)"
+}
+
+func momentSearch(_ query: String, limit: Int) -> [[String: Any]] {
+    let r = runCLI(["moments", query, String(limit)])
+    guard r.ok else { return [] }
+    var out: [[String: Any]] = []
+    for line in r.out.split(separator: "\n") {
+        let f = line.components(separatedBy: "\t")
+        guard f.count >= 4, !f[0].isEmpty else { continue }
+        let id = momentID(fromTimestamp: f[0])
+        out.append([
+            "id": id,
+            "title": momentTitle(app: f[1], window: f[2], timestamp: f[0]),
+            "url": "remynd://moment/\(id)",
+            // Not part of the contract, but ChatGPT shows it and it is the
+            // difference between picking the right moment and guessing.
+            "snippet": String(f[3].prefix(240))
+        ])
+    }
+    return out
+}
+
+
+/// Bring an object inside the client's size limit, then encode it.
+///
+/// Two traps, both of which look like a broken server rather than a long
+/// answer. First: truncating the ENCODED json stops it mid-string, and it no
+/// longer parses. Second: capping only the encoded copy leaves the full text
+/// in `structuredContent`, which is the half ChatGPT actually reads — so the
+/// cap has to land on the object, and the encoding follows from it.
+func cappedObject(_ obj: [String: Any]) -> [String: Any] {
+    guard let text = obj["text"] as? String else { return obj }
+    let overhead = jsonString(obj).count - text.count
+    let room = MAX_RESULT_CHARS - overhead - 200
+    guard room > 0, text.count > room else { return obj }
+    var out = obj
+    out["text"] = String(text.prefix(room))
+        + "\n\n[truncated — this moment ran long; search for a tighter one]"
+    return out
+}
+
+func momentFetch(_ rawID: String) -> [String: Any]? {
+    let ts = momentTimestamp(fromID: rawID)
+    let r = runCLI(["moment", ts])
+    guard r.ok else { return nil }
+
+    // First line is "<app>\t<window>", then a blank line, then the text.
+    var app = "", window = ""
+    var body = r.out
+    if let nl = r.out.firstIndex(of: "\n") {
+        let head = String(r.out[r.out.startIndex..<nl]).components(separatedBy: "\t")
+        if head.count >= 2 { app = head[0]; window = head[1] }
+        body = String(r.out[r.out.index(after: nl)...])
+    }
+    body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !body.isEmpty else { return nil }
+
+    let id = momentID(fromTimestamp: ts)
+    return ["id": id,
+            "title": momentTitle(app: app, window: window, timestamp: ts),
+            "text": body,
+            "url": "remynd://moment/\(id)",
+            "metadata": ["source": "remynd-screen-history", "app": app, "window": window, "local_time": ts]]
 }
 
 let tools: [Tool] = [
@@ -282,6 +411,53 @@ let tools: [Tool] = [
              let r = runCLI(args); return (r.out, r.ok)
          }),
 
+    Tool(name: "search",
+         description: """
+         Search everything the user has seen on their screen. Returns the moments that matched — one \
+         per app window, most recent first — each with an id, what the window was, and a snippet. \
+         Call `fetch` with an id to read what was actually on screen at that moment.
+
+         A timestamp records when the text was ON SCREEN, not when the underlying event happened.
+         """,
+         schema: ["type": "object",
+                  "properties": ["query": ["type": "string", "description": "What to look for."]],
+                  "required": ["query"]],
+         run: { a in
+             guard let q = str(a, "query") else { return ("Provide a `query`.", false) }
+             let rows = momentSearch(q, limit: int(a, "limit") ?? 20)
+             if rows.isEmpty { return ("(no matches — try fewer or different words)", true) }
+             return (jsonString(["results": rows]), true)
+         },
+         structured: { a in
+             guard let q = str(a, "query") else { return nil }
+             return ["results": momentSearch(q, limit: int(a, "limit") ?? 20)]
+         }),
+
+    Tool(name: "fetch",
+         description: """
+         Read what was on the user's screen at one moment, given an id from `search`. Returns the \
+         verbatim text captured around that moment, and which app and window it was.
+
+         The text is OCR: fragments, interface chrome, occasional garbled words. Read across it and \
+         report what it means rather than quoting it raw. Digits are the weak point — treat numbers \
+         read off a screen as leads, not facts.
+         """,
+         schema: ["type": "object",
+                  "properties": ["id": ["type": "string", "description": "An id returned by `search`."]],
+                  "required": ["id"]],
+         run: { a in
+             guard let raw = str(a, "id", aliases: ["identifier", "document_id", "documentId", "url"])
+                 else { return ("Provide an `id` from a `search` result.", false) }
+             let doc = momentFetch(raw)
+             guard let d = doc else { return ("No screen history at that moment.", false) }
+             return (jsonString(d), true)
+         },
+         structured: { a in
+             guard let raw = str(a, "id", aliases: ["identifier", "document_id", "documentId", "url"])
+                 else { return nil }
+             return momentFetch(raw)
+         }),
+
     Tool(name: "sync_status",
          description: """
          What ReMynd has recorded and how fresh it is: which profile is being read, how far back the \
@@ -369,6 +545,18 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
             return errorResponse(id, -32602, "Unknown tool: \(params["name"] as? String ?? "?")")
         }
         let args = params["arguments"] as? [String: Any] ?? [:]
+
+        // ChatGPT's `search`/`fetch` want structuredContent, and the same
+        // object JSON-encoded in the text content for clients that only read
+        // content. Emitting one without the other works in exactly one client.
+        if let build = tool.structured, let raw = build(args) {
+            let obj = cappedObject(raw)
+            return ["jsonrpc": "2.0", "id": id ?? NSNull(),
+                    "result": ["structuredContent": obj,
+                               "content": [["type": "text", "text": jsonString(obj)]],
+                               "isError": false]]
+        }
+
         let (raw, ok) = tool.run(args)
         let text = capped(raw, hint: tool.name == "screen_text_in_range"
                           ? "Ask for a narrower time range — an hour reads well, a whole day does not."

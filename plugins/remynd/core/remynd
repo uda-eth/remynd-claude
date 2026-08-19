@@ -269,12 +269,104 @@ _ago() {
   else                           echo "$(( s / 86400 ))d"; fi
 }
 
+# ---------------------------------------------------------------------------
+# Machine-readable output, for callers that need fields rather than a report.
+#
+# `search` and `fetch` in the MCP server build ChatGPT's connector contract out
+# of these — that contract wants an id, a title and a url per result, and
+# parsing those back out of the human-facing report would be guesswork. So the
+# CLI grew one command that emits them directly.
+#
+# A "moment" is one focused window, not one OCR line. A search for a word that
+# was on screen for ten minutes matches hundreds of segments inside the same
+# window; returning those as hundreds of results is noise. Collapsing them to
+# the window gives one result per thing-the-user-was-actually-looking-at.
+# ---------------------------------------------------------------------------
+cmd_moments() {
+  [ $# -ge 1 ] || die "usage: remynd moments <query> [limit]"
+  local q="$1" limit="${2:-20}" db redact esc
+  db="$(remynd_db_path "$(_profile)")"
+  redact="$(remynd_config_get redact_credentials 1)"
+  esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
+
+  # Over-fetch segments so that after collapsing to windows there are still
+  # `limit` distinct moments to return.
+  local scan=$(( limit * 12 ))
+
+  remynd_sql "$db" "
+    WITH hits AS (
+      SELECT s.firstSeenAt AS ts, s.displayText AS txt
+      FROM OCRTextSegment s
+      JOIN OCRTextSegment_FTS f ON f.rowid = s.id
+      WHERE OCRTextSegment_FTS MATCH '$esc'
+      ORDER BY s.firstSeenAt DESC
+      LIMIT $scan
+    ),
+    -- ORDER BY x.id, not x.startedAt. There is no index on startedAt, so
+    -- ordering by it full-scans 187k FocusedWindow rows for EVERY hit: 8.5s
+    -- for twenty results. startedAt rises with the rowid, so walking the rowid
+    -- index backwards and stopping at the first match finds the same row in
+    -- 47ms — verified identical on a 40-row sample, 0 disagreements.
+    tagged AS (
+      SELECT h.ts, h.txt,
+             (SELECT x.id FROM FocusedWindow x
+               WHERE x.startedAt <= h.ts
+               ORDER BY x.id DESC LIMIT 1) AS wid
+      FROM hits h
+    )
+    SELECT COALESCE(t.wid, 0),
+           datetime(t.ts,'localtime'),
+           COALESCE(w.applicationName,''),
+           COALESCE(w.windowTitle,''),
+           REPLACE(REPLACE(REPLACE(t.txt, char(10), ' '), char(9), ' '), char(13), ' ')
+    FROM tagged t LEFT JOIN FocusedWindow w ON w.id = t.wid
+    ORDER BY t.ts DESC;" |
+  /usr/bin/awk -F"$REMYND_FS" -v doredact="$redact" -v lim="$limit" '
+'"$(_remynd_redact_awk)"'
+    NF >= 5 {
+      # One row per focused window: the first row for a window is its most
+      # recent hit, which is the one worth showing.
+      if ($1 != 0 && seen[$1]++) next
+      if (n++ >= lim) exit
+      t = $5; if (doredact == 1) t = redact(t)
+      printf "%s\t%s\t%s\t%s\n", $2, $3, $4, t
+    }'
+}
+
+# One moment, expanded: which app and window it was, then the text that was on
+# screen around it. `fetch` in the MCP server is exactly this call — ChatGPT
+# hands back an id from `moments` and expects the document behind it.
+cmd_moment() {
+  [ $# -ge 1 ] || die "usage: remynd moment <YYYY-MM-DD HH:MM:SS> [minutes]"
+  local ts="$1" span="${2:-4}" db ts_utc
+  db="$(remynd_db_path "$(_profile)")"
+  ts_utc="$(remynd_local_to_utc "$ts")" || die "bad timestamp: $ts"
+
+  # The window that was focused at that instant. Same rowid-ordering trick as
+  # cmd_moments, for the same reason.
+  remynd_sql "$db" "
+    SELECT COALESCE(applicationName,''), COALESCE(windowTitle,'')
+    FROM FocusedWindow
+    WHERE startedAt <= '$ts_utc'
+    ORDER BY id DESC LIMIT 1;" |
+  /usr/bin/awk -F"$REMYND_FS" 'NR==1 { printf "%s\t%s\n", $1, $2 } END { if (NR==0) print "\t" }'
+  echo
+
+  local from to
+  from="$(/bin/date -j -v-"${span}"M -f '%Y-%m-%d %H:%M:%S' "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
+    || die "bad timestamp: $ts"
+  to="$(/bin/date -j -v+"${span}"M -f '%Y-%m-%d %H:%M:%S' "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+  cmd_text "$from" "$to"
+}
+
 cmd_refresh() { "$_here/remynd-refresh.sh" --force && cmd_status; }
 
 case "${1:-}" in
   now)     shift; cmd_now "$@" ;;
   recent)  shift; cmd_recent "$@" ;;
   search)  shift; cmd_search "$@" ;;
+  moments) shift; cmd_moments "$@" ;;
+  moment)  shift; cmd_moment "$@" ;;
   day)     shift; cmd_day "$@" ;;
   apps)    shift; cmd_apps "$@" ;;
   text)    shift; cmd_text "$@" ;;
