@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# remynd — read your own screen history from the terminal.
+#
+# The retrieval surface shared by every agent: the Claude Code /remynd skill
+# calls it, the Codex adapter calls it, and you can call it yourself. Keeping
+# one implementation is why the two agents can't drift apart.
+#
+# READ-ONLY. Opens ReMynd's database with mode=ro; never writes to it.
+# ---------------------------------------------------------------------------
+set -u
+
+_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$_here/remynd-digest.sh" 2>/dev/null || { echo "remynd: core not found" >&2; exit 1; }
+
+die() { printf 'remynd: %s\n' "$*" >&2; exit 1; }
+
+_profile() {
+  local p
+  p="$(remynd_find_profile)" || die "no ReMynd recordings found on this Mac.
+Is ReMynd installed and has it recorded yet? (Set REMYND_PROFILE to override.)"
+  printf '%s\n' "$p"
+}
+
+usage() {
+  cat <<'USAGE'
+remynd — your own screen history, on the command line
+
+  remynd now                     what you are doing right now
+  remynd recent [minutes]        digest of recent activity (default 30)
+  remynd search <query> [n]      full-text search everything you've seen
+  remynd day <YYYY-MM-DD>        reconstruct a day
+  remynd apps [days]             where your time went (default 7)
+  remynd text <from> [to]        verbatim screen text in a time range
+  remynd status                  sync state, profile, freshness
+  remynd refresh                 rebuild the cached digest now
+
+Times are LOCAL. Everything is read-only.
+
+Examples
+  remynd search "stripe webhook"
+  remynd day 2026-08-13
+  remynd text "2026-08-13 23:30" "2026-08-13 23:45"
+USAGE
+}
+
+cmd_now() {
+  local db; db="$(remynd_db_path "$(_profile)")"
+  local n; n="$(remynd_now "$db")"
+  [ -n "$n" ] && echo "$n" || echo "(nothing recorded yet)"
+}
+
+cmd_recent() {
+  local mins="${1:-30}" db redact
+  db="$(remynd_db_path "$(_profile)")"
+  redact="$(remynd_config_get redact_credentials 1)"
+  remynd_digest_full "$db" "$mins" "$(remynd_config_get session_budget_tokens 8000)" "$redact"
+}
+
+# Full-text search over everything that has been on screen.
+cmd_search() {
+  [ $# -ge 1 ] || die "usage: remynd search <query> [limit]"
+  local q="$1" limit="${2:-40}" db redact
+  db="$(remynd_db_path "$(_profile)")"
+  redact="$(remynd_config_get redact_credentials 1)"
+
+  # FTS5 MATCH. Single quotes doubled for SQL; the query is passed as a
+  # phrase-tolerant expression so multi-word searches behave as expected.
+  local esc; esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
+
+  remynd_sql "$db" "
+    SELECT datetime(s.firstSeenAt,'localtime'), REPLACE(s.displayText, char(10), ' ')
+    FROM OCRTextSegment s
+    JOIN OCRTextSegment_FTS f ON f.rowid = s.id
+    WHERE OCRTextSegment_FTS MATCH '$esc'
+    ORDER BY s.firstSeenAt DESC
+    LIMIT $limit;" |
+  /usr/bin/awk -F"$REMYND_FS" -v doredact="$redact" '
+'"$(_remynd_redact_awk)"'
+    NF { t = $2; if (doredact == 1) t = redact(t); printf "%s  %s\n", $1, t }
+    END { if (NR == 0) print "(no matches — try fewer or different words)" }'
+}
+
+cmd_day() {
+  [ $# -ge 1 ] || die "usage: remynd day <YYYY-MM-DD>"
+  local day="$1" db next
+  db="$(remynd_db_path "$(_profile)")"
+  next="$(/bin/date -j -v+1d -f '%Y-%m-%d' "$day" '+%Y-%m-%d' 2>/dev/null)" || die "bad date: $day"
+
+  # The user means a LOCAL day; the database is in UTC. Convert both ends.
+  local from_utc to_utc lo hi
+  from_utc="$(remynd_local_to_utc "$day 00:00:00")"  || die "bad date: $day"
+  to_utc="$(remynd_local_to_utc "$next 00:00:00")"   || die "bad date: $day"
+  lo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$from_utc")"
+  hi="$(remynd_id_at_time "$db" FocusedWindow startedAt "$to_utc")"
+
+  echo "# $day"
+  echo
+  echo "## Where the time went"
+  remynd_sql "$db" "
+    SELECT applicationName,
+           CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) / 60 AS INT) mins
+    FROM FocusedWindow
+    WHERE id >= $lo AND id < $hi AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
+    GROUP BY applicationName HAVING mins > 0 ORDER BY mins DESC LIMIT 15;" |
+  /usr/bin/awk -F"$REMYND_FS" 'NF { printf "  %-28s %sm\n", $1, $2 }'
+
+  echo
+  echo "## Timeline"
+  remynd_sql "$db" "
+    SELECT datetime(MIN(startedAt),'localtime') t, applicationName, windowTitle
+    FROM FocusedWindow
+    WHERE id >= $lo AND id < $hi AND windowTitle IS NOT NULL AND windowTitle != ''
+    GROUP BY applicationName, windowTitle ORDER BY t ASC LIMIT 60;" |
+  /usr/bin/awk -F"$REMYND_FS" 'NF { printf "  %s  %s — %s\n", substr($1,12,5), $2, $3 }'
+
+  echo
+  echo "For the verbatim screen text of any stretch:  remynd text \"$day HH:MM\" \"$day HH:MM\""
+}
+
+cmd_apps() {
+  local days="${1:-7}" db since
+  db="$(remynd_db_path "$(_profile)")"
+  since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S')"
+  local lo; lo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$since")"
+  echo "# Time by app, last $days days"
+  echo
+  remynd_sql "$db" "
+    SELECT applicationName,
+           CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) / 60 AS INT) mins
+    FROM FocusedWindow
+    WHERE id >= $lo AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
+    GROUP BY applicationName HAVING mins > 0 ORDER BY mins DESC LIMIT 20;" |
+  /usr/bin/awk -F"$REMYND_FS" '
+    NF { h = int($2/60); m = $2%60; printf "  %-30s %3dh %02dm\n", $1, h, m }'
+}
+
+cmd_text() {
+  [ $# -ge 1 ] || die "usage: remynd text <from> [to]      e.g. remynd text \"2026-08-13 23:30\" \"2026-08-13 23:45\""
+  local from="$1" to="${2:-}" db redact lo hi
+  db="$(remynd_db_path "$(_profile)")"
+  redact="$(remynd_config_get redact_credentials 1)"
+  case "$from" in *:*:*) ;; *:*) from="$from:00" ;; *) from="$from 00:00:00" ;; esac
+  from="$(remynd_local_to_utc "$from")" || die "bad time: $1"
+  lo="$(remynd_id_at_time "$db" OCRTextSegment firstSeenAt "$from")"
+  if [ -n "$to" ]; then
+    case "$to" in *:*:*) ;; *:*) to="$to:00" ;; *) to="$to 00:00:00" ;; esac
+    to="$(remynd_local_to_utc "$to")" || die "bad time: $2"
+    hi="$(remynd_id_at_time "$db" OCRTextSegment firstSeenAt "$to")"
+  else
+    hi="$(remynd_max_ocr_id "$db")"; hi=$(( hi + 1 ))
+  fi
+
+  remynd_sql "$db" "
+    SELECT datetime(firstSeenAt,'localtime'), REPLACE(REPLACE(displayText, char(10), ' '), char(13), ' '), normalizedText
+    FROM OCRTextSegment WHERE id >= $lo AND id < $hi ORDER BY id ASC;" |
+  /usr/bin/awk -F"$REMYND_FS" -v doredact="$redact" '
+'"$(_remynd_redact_awk)"'
+    { k = $3; if (k == "") k = $2
+      if (k in seen) next
+      seen[k] = 1
+      t = $2; if (t == "") next
+      if (t in shown) next
+      shown[t] = 1
+      if (doredact == 1) t = redact(t)
+      printf "%s  %s\n", substr($1, 12, 8), t }
+    END { if (NR == 0) print "(nothing recorded in that range)" }'
+}
+
+cmd_status() {
+  local p db state
+  if ! p="$(remynd_find_profile 2>/dev/null)"; then
+    echo "ReMynd:      not found"
+    echo "Sync:        inactive (nothing to read yet)"
+    return 0
+  fi
+  db="$(remynd_db_path "$p")"
+  state="$(remynd_state_dir)"
+
+  local mtime now age last
+  mtime="$(remynd_db_mtime "$db")"
+  now="$(/bin/date +%s)"
+  age=$(( now - mtime ))
+  last="$(remynd_sql "$db" "SELECT datetime(firstSeenAt,'localtime') FROM OCRTextSegment ORDER BY id DESC LIMIT 1;")"
+
+  echo "Profile:     $p"
+  case "$(basename "$p")" in
+    *-dev-*|*-dev) echo "Build:       DEVELOPMENT (production is preferred when both exist)" ;;
+    *)             echo "Build:       production" ;;
+  esac
+  echo "Database:    $(/usr/bin/du -h "$db" 2>/dev/null | /usr/bin/awk '{print $1}')"
+  echo "Last write:  $(_ago "$age") ago"
+  [ -n "$last" ] && echo "Last capture: $last (local time)"
+  echo "Redaction:   $([ "$(remynd_config_get redact_credentials 1)" = "1" ] && echo "on (credential-shaped strings)" || echo "OFF")"
+  echo "Enabled:     $([ "$(remynd_config_get enabled 1)" = "1" ] && echo yes || echo no)"
+  if [ -f "$state/context.md" ]; then
+    echo "Cache:       $(remynd_tokens_of_file "$state/context.md") tokens, refreshed $(_ago $(( now - $(stat -f %m "$state/context.md") ))) ago"
+  else
+    echo "Cache:       not built yet (run: remynd refresh)"
+  fi
+}
+
+_ago() {
+  local s="$1"
+  if   [ "$s" -lt 90 ]    ; then echo "${s}s"
+  elif [ "$s" -lt 5400 ]  ; then echo "$(( s / 60 ))m"
+  elif [ "$s" -lt 172800 ]; then echo "$(( s / 3600 ))h"
+  else                           echo "$(( s / 86400 ))d"; fi
+}
+
+cmd_refresh() { "$_here/remynd-refresh.sh" --force && cmd_status; }
+
+case "${1:-}" in
+  now)     shift; cmd_now "$@" ;;
+  recent)  shift; cmd_recent "$@" ;;
+  search)  shift; cmd_search "$@" ;;
+  day)     shift; cmd_day "$@" ;;
+  apps)    shift; cmd_apps "$@" ;;
+  text)    shift; cmd_text "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1 (try: remynd help)" ;;
+esac

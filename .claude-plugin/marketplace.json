@@ -1,0 +1,17 @@
+{
+  "name": "remynd",
+  "owner": { "name": "Move 37", "url": "https://remyndai.com" },
+  "metadata": {
+    "description": "ReMynd — your own screen history, wired into your coding agent",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "remynd",
+      "source": "./plugins/remynd",
+      "description": "Always-on personal context from your ReMynd screen history, plus the /remynd skill for searching everything you've seen.",
+      "category": "productivity",
+      "strict": false
+    }
+  ]
+}

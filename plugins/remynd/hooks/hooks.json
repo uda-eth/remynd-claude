@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"${CLAUDE_PLUGIN_ROOT}/core/remynd-session-hook.sh\" || exit 0; bash \"${CLAUDE_PLUGIN_ROOT}/core/remynd-session-hook.sh\"",
+            "statusMessage": "Loading your ReMynd context…",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"${CLAUDE_PLUGIN_ROOT}/core/remynd-delta-hook.sh\" || exit 0; bash \"${CLAUDE_PLUGIN_ROOT}/core/remynd-delta-hook.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

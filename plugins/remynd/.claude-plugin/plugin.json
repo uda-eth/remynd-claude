@@ -1,0 +1,10 @@
+{
+  "name": "remynd",
+  "version": "1.0.0",
+  "description": "Your ReMynd screen history as always-on context: every session starts knowing what you were working on, and stays current as you work. Adds the /remynd skill for searching everything you've ever seen.",
+  "author": { "name": "Move 37", "url": "https://remyndai.com" },
+  "homepage": "https://remyndai.com",
+  "repository": "https://github.com/uda-eth/remynd-claude",
+  "license": "MIT",
+  "keywords": ["remynd", "memory", "context", "screen-history", "recall", "personal-context"]
+}
