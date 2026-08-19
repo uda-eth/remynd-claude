@@ -80,9 +80,15 @@ remynd_db_mtime() {
 remynd_db_path() { printf '%s/Recordings/app.db\n' "$1"; }
 
 # Read-only URI. WAL allows concurrent readers while the recorder writes.
+# OCR'd text and window titles regularly contain invalid UTF-8 (the recogniser
+# emits partial sequences). Left alone, awk aborts with "towc: multibyte
+# conversion failure" mid-stream. iconv -c drops the bad sequences so the rest
+# of the pipeline can stay in a UTF-8 locale, which the title normaliser needs
+# for its multibyte character classes.
 remynd_sql() {
   local db="$1"; shift
-  "$REMYND_SQLITE" -readonly -noheader -separator "$REMYND_FS" "file:$db?mode=ro&immutable=0" "$@" 2>/dev/null
+  "$REMYND_SQLITE" -readonly -noheader -separator "$REMYND_FS" "file:$db?mode=ro&immutable=0" "$@" 2>/dev/null |
+    /usr/bin/iconv -c -f UTF-8 -t UTF-8 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------

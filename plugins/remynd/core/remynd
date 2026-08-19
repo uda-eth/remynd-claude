@@ -104,34 +104,56 @@ cmd_day() {
   next="$(/bin/date -j -v+1d -f '%Y-%m-%d' "$day" '+%Y-%m-%d' 2>/dev/null)" || die "bad date: $day"
 
   # The user means a LOCAL day; the database is in UTC. Convert both ends.
-  local from_utc to_utc lo hi
+  local from_utc to_utc lo hi olo ohi redact
   from_utc="$(remynd_local_to_utc "$day 00:00:00")"  || die "bad date: $day"
   to_utc="$(remynd_local_to_utc "$next 00:00:00")"   || die "bad date: $day"
   lo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$from_utc")"
   hi="$(remynd_id_at_time "$db" FocusedWindow startedAt "$to_utc")"
+  redact="$(remynd_config_get redact_credentials 1)"
 
-  echo "# $day"
+  echo "# $day ($(/bin/date -j -f '%Y-%m-%d' "$day" '+%A' 2>/dev/null))"
   echo
-  echo "## Where the time went"
-  remynd_sql "$db" "
-    SELECT applicationName,
-           CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) / 60 AS INT) mins
-    FROM FocusedWindow
-    WHERE id >= $lo AND id < $hi AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
-    GROUP BY applicationName HAVING mins > 0 ORDER BY mins DESC LIMIT 15;" |
-  /usr/bin/awk -F"$REMYND_FS" 'NF { printf "  %-28s %sm\n", $1, $2 }'
 
-  echo
-  echo "## Timeline"
+  local act; act="$(remynd_activity_rollup "$db" "$lo" "$hi" 14)"
+  if [ -n "$act" ]; then
+    echo "## What you worked on"
+    echo "$act"
+    echo
+  else
+    echo "_Nothing recorded on this day._"
+    echo
+    return 0
+  fi
+
+  local sites; sites="$(remynd_domains "$db" "$lo" "$hi" 12)"
+  [ -n "$sites" ] && { echo "## Sites"; echo "$sites"; echo; }
+
+  echo "## How the day ran"
   remynd_sql "$db" "
     SELECT datetime(MIN(startedAt),'localtime') t, applicationName, windowTitle
     FROM FocusedWindow
     WHERE id >= $lo AND id < $hi AND windowTitle IS NOT NULL AND windowTitle != ''
-    GROUP BY applicationName, windowTitle ORDER BY t ASC LIMIT 60;" |
-  /usr/bin/awk -F"$REMYND_FS" 'NF { printf "  %s  %s — %s\n", substr($1,12,5), $2, $3 }'
+    GROUP BY applicationName, windowTitle ORDER BY t ASC LIMIT 400;" |
+  /usr/bin/awk -F"$REMYND_FS" '
+'"$(_remynd_title_awk)"'
+    { hr = substr($1, 12, 2)
+      t = norm_title($3)
+      if (t == "") next
+      if (hr != last) { if (last != "") printf "\n"; printf "  %s:00  ", hr; last = hr; n = 0; delete seen }
+      key = tolower(substr(t, 1, 28))
+      if (key in seen) next
+      seen[key] = 1
+      if (n < 4) {
+        d = t
+        if (length(d) > 40) { d = substr(d, 1, 40); sub(/[^ ]*$/, "", d); sub(/ +$/, "", d) }
+        printf "%s%s", (n ? "  |  " : ""), d; n++
+      }
+      else if (n == 4) { printf "  |  ..."; n++ }
+    }
+    END { if (last != "") printf "\n" }'
 
   echo
-  echo "For the verbatim screen text of any stretch:  remynd text \"$day HH:MM\" \"$day HH:MM\""
+  echo "Verbatim screen text for any stretch:  remynd text \"$day HH:MM\" \"$day HH:MM\""
 }
 
 cmd_apps() {

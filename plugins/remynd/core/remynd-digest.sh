@@ -270,11 +270,19 @@ remynd_digest_full() {
     now_line="$(remynd_now "$db")"
     [ -n "$now_line" ] && { echo "## Right now"; echo "$now_line"; echo; }
 
+    # Lead with WHAT, not WHERE. "Google Chrome 34m" is an accounting answer;
+    # the subject lives in the window title.
+    local wlo whi acts
+    wlo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$hours_cut")"
+    whi="$(remynd_max_window_id "$db")"; whi=$(( whi + 1 ))
+    acts="$(remynd_activity_rollup "$db" "$wlo" "$whi" 8)"
+    [ -n "$acts" ] && { echo "## What you've been working on (last 2h)"; echo "$acts"; echo; }
+
     apps="$(remynd_app_rollup "$db" "$hours_cut")"
-    [ -n "$apps" ] && { echo "## Last 2 hours"; echo "$apps"; echo; }
+    [ -n "$apps" ] && { echo "## Time by app"; echo "$apps"; echo; }
 
     wins="$(remynd_window_trail "$db" "$hours_cut")"
-    [ -n "$wins" ] && { echo "## What you had open"; echo "$wins"; echo; }
+    [ -n "$wins" ] && { echo "## Recently open"; echo "$wins"; echo; }
 
     web="$(remynd_web_trail "$db" "$hours_cut")"
     [ -n "$web" ] && { echo "## What you were reading"; echo "$web"; echo; }
@@ -412,4 +420,144 @@ remynd_digest_delta_id() {
 
   printf '# ReMynd — since we last spoke\n\n%s' "$body"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# Activity rollup — what you were DOING, not which app you were in.
+#
+# "Google Chrome 536m" is an accounting answer to a question nobody asked.
+# The subject lives in the window title, so this ranks normalised titles by
+# dwell time instead of ranking apps.
+#
+# Normalisation matters more than it looks: a Terminal running Claude Code
+# re-titles itself every frame with a different spinner glyph, so one stretch
+# of work fragments into a dozen rows that each look minor. Collapsing those
+# turns three 19-minute rows into one 87-minute activity.
+# ---------------------------------------------------------------------------
+_remynd_title_awk() {
+  cat <<'AWK'
+function norm_title(t) {
+  gsub(/^\([0-9,]+\)[ ]*/, "", t)                 # (1) notification counts
+  gsub(/\([0-9][0-9,]*\)/, "", t)                 # Inbox (35,979)
+  gsub(/[✳✻✽◐◑◒◓●○◉◍◌⏺⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, "", t)      # spinner frames
+  gsub(/[◂▸►◄]/, " ", t)                          # progress arrows
+  gsub(/[ ]+[-—][ ]+[0-9]+[x×][0-9]+[ ]*$/, "", t)  # terminal geometry
+  gsub(/[ ]+[-—][ ]+(Google Chrome|Safari|Mozilla Firefox|Arc|Microsoft Edge)[ ]*$/, "", t)
+  gsub(/^[A-Za-z0-9_.-]+[ ]+[-—][ ]+/, "", t)     # leading shell username
+  gsub(/[ ]*[-—][ ]*caffeinate[ ]*/, " ", t)      # caffeinate wrapper
+  gsub(/[\t ]+/, " ", t)
+  sub(/^ +/, "", t); sub(/ +$/, "", t)
+  sub(/[ ]*[-—|][ ]*$/, "", t)
+  return t
+}
+AWK
+}
+
+# remynd_activity_rollup <db> <lo_id> <hi_id> [limit]
+# Ranks what the user was actually doing, by minutes, across apps.
+remynd_activity_rollup() {
+  local db="$1" lo="$2" hi="$3" limit="${4:-14}"
+  remynd_sql "$db" "
+    SELECT CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) AS INT) secs,
+           applicationName, windowTitle
+    FROM FocusedWindow
+    WHERE id >= $lo AND id < $hi
+      AND windowTitle IS NOT NULL AND windowTitle != ''
+      AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','WindowServer')
+    GROUP BY applicationName, windowTitle;" |
+  /usr/bin/awk -F"$REMYND_FS" -v limit="$limit" '
+'"$(_remynd_title_awk)"'
+    function canon(t,   c) {
+      c = tolower(t)
+      gsub(/[-—|:,]/, " ", c)
+      gsub(/[ ]+/, " ", c)
+      sub(/^ +/, "", c); sub(/ +$/, "", c)
+      return c
+    }
+    {
+      t = norm_title($3)
+      if (t == "") next
+      c = canon(t)
+      if (c == "") next
+      secs[c] += $1
+      # Keep the shortest human title seen for this activity as the label.
+      if (!(c in label) || length(t) < length(label[c])) label[c] = t
+      if (!(c in app)) app[c] = $2
+    }
+    END {
+      # Merge activities whose canonical key is a prefix of another: a window
+      # that appends detail ("Carla | Messages" -> "Carla | Messages - Ali,
+      # Eric, ...") is the same activity, not a separate one.
+      n = 0
+      for (c in secs) { n++; ks[n] = c }
+      for (i = 1; i <= n; i++)
+        for (j = 1; j <= n; j++) {
+          if (i == j || secs[ks[i]] == -1 || secs[ks[j]] == -1) continue
+          # Only merge within the same app, and never let a very short generic
+          # title act as the absorbing prefix — a Finder window called "ReMynd"
+          # is not the same activity as a Terminal running the landing page.
+          if (app[ks[i]] != app[ks[j]]) continue
+          if (length(ks[i]) < 10) continue
+          if (length(ks[i]) < length(ks[j]) && index(ks[j], ks[i] " ") == 1) {
+            secs[ks[i]] += secs[ks[j]]
+            secs[ks[j]] = -1
+          }
+        }
+      n = 0
+      for (c in secs) { if (secs[c] >= 0) { n++; keys[n] = c } }
+      # simple descending sort by seconds
+      for (i = 1; i <= n; i++)
+        for (j = i + 1; j <= n; j++)
+          if (secs[keys[j]] > secs[keys[i]]) { tmp = keys[i]; keys[i] = keys[j]; keys[j] = tmp }
+      shown = 0
+      for (i = 1; i <= n && shown < limit; i++) {
+        s = secs[keys[i]]
+        if (s < 120) continue          # under two minutes is noise, not an activity
+        h = int(s / 3600); m = int((s % 3600) / 60)
+        if (h > 0) dur = sprintf("%dh%02dm", h, m); else dur = sprintf("%dm", m)
+        printf "  %-7s %s  (%s)\n", dur, label[keys[i]], app[keys[i]]
+        shown++
+      }
+    }'
+}
+
+# Sites visited in a window, from real URLs.
+#
+# An earlier version guessed the site from the tail of the window title. That
+# produced "control", "jng" and "ready." as sites, which is worse than saying
+# nothing. If the browser extension isn't installed, WebURLVisit is empty and
+# this prints nothing at all — an honest blank beats confident noise.
+remynd_domains() {
+  local db="$1" lo="$2" hi="$3" limit="${4:-10}"
+  local wlo whi
+  wlo="$(remynd_sql "$db" "SELECT COALESCE(MIN(id),0) FROM WebURLVisit;")"
+  whi="$(remynd_sql "$db" "SELECT COALESCE(MAX(id),0) FROM WebURLVisit;")"
+  [ "${whi:-0}" -gt 0 ] || return 0
+
+  remynd_sql "$db" "
+    SELECT u.url, COUNT(*) n
+    FROM (SELECT id, webURLId, navigatedToAt FROM WebURLVisit ORDER BY id DESC LIMIT 40000) v
+    JOIN WebUrl u ON u.id = v.webURLId
+    WHERE v.navigatedToAt >= (SELECT datetime(startedAt) FROM FocusedWindow WHERE id >= $lo LIMIT 1)
+      AND v.navigatedToAt <  (SELECT datetime(startedAt) FROM FocusedWindow WHERE id >= $hi LIMIT 1)
+    GROUP BY u.url;" |
+  /usr/bin/awk -F"$REMYND_FS" -v limit="$limit" '"'"'
+    {
+      d = $1
+      sub(/^https?:\/\//, "", d)
+      sub(/\/.*$/, "", d)
+      sub(/^www\./, "", d)
+      if (d == "" || d !~ /\./) next
+      hits[d] += $2
+    }
+    END {
+      n = 0
+      for (d in hits) { n++; k[n] = d }
+      for (i = 1; i <= n; i++)
+        for (j = i + 1; j <= n; j++)
+          if (hits[k[j]] > hits[k[i]]) { t = k[i]; k[i] = k[j]; k[j] = t }
+      out = ""
+      for (i = 1; i <= n && i <= limit; i++) out = out (i > 1 ? " . " : "  ") k[i]
+      if (out != "") print out
+    }'"'"'
 }
