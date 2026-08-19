@@ -84,6 +84,20 @@ cmd_search() {
   # phrase-tolerant expression so multi-word searches behave as expected.
   local esc; esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
 
+  # Say how many matched, not just how many were shown. Returning the 40 most
+  # recent of 3,071 hits without saying so reads as "that is all there is".
+  local total
+  total="$(remynd_sql_num "$db" "
+    SELECT COUNT(*) FROM OCRTextSegment s
+    JOIN OCRTextSegment_FTS f ON f.rowid = s.id
+    WHERE OCRTextSegment_FTS MATCH '$esc';")"
+  if [ -n "$total" ] && [ "$total" -gt "$limit" ]; then
+    printf 'Showing the %s most recent of %s matches. Narrow the query, or raise the limit: remynd search "%s" %s
+
+' \
+      "$limit" "$total" "$q" "$((limit * 5))"
+  fi
+
   remynd_sql "$db" "
     SELECT datetime(s.firstSeenAt,'localtime'), REPLACE(s.displayText, char(10), ' ')
     FROM OCRTextSegment s
