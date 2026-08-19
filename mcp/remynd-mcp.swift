@@ -69,10 +69,51 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     // Read before waiting: a pipe that fills up deadlocks a process that is
     // still writing to it.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+    // Enforce the timeout. It used to be an unused parameter, which meant a
+    // wedged query could hang the client forever with no way to tell why.
+    let deadline = Date().addingTimeInterval(timeout)
+    while p.isRunning && Date() < deadline { usleep(20_000) }
+    if p.isRunning {
+        p.terminate()
+        return ("The ReMynd query timed out after \(Int(timeout))s. Try a narrower time range.", false)
+    }
     p.waitUntilExit()
 
     let text = String(data: data, encoding: .utf8) ?? ""
+
+    // Never report emptiness as if it were an answer. An empty result with a
+    // zero exit is a real "nothing found"; anything else is a fault, and the
+    // model needs to see which so it can react instead of guessing.
+    if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if p.terminationStatus != 0 {
+            return ("The ReMynd CLI failed (exit \(p.terminationStatus)) and produced no output. "
+                    + "Command: remynd \(args.joined(separator: " "))", false)
+        }
+        return ("No results for: remynd \(args.joined(separator: " ")). "
+                + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)
+    }
     return (text, p.terminationStatus == 0)
+}
+
+// ---------------------------------------------------------------------------
+// Result size
+//
+// A tool result is not a file. `screen_text_in_range` over a whole day returned
+// 876,307 characters in real use and blew past the client's limit, which turns
+// a useful answer into an error and wastes the round trip. Cap it, and say what
+// was cut and how to ask for less.
+// ---------------------------------------------------------------------------
+let MAX_RESULT_CHARS = 24_000
+
+func capped(_ text: String, hint: String) -> String {
+    guard text.count > MAX_RESULT_CHARS else { return text }
+    let head = String(text.prefix(MAX_RESULT_CHARS))
+    // Cut at a line boundary so the tail is never a half-line.
+    let trimmed = head.lastIndex(of: "\n").map { String(head[..<$0]) } ?? head
+    let droppedLines = text.split(separator: "\n").count - trimmed.split(separator: "\n").count
+    return trimmed + "\n\n[Truncated: \(droppedLines) more lines, "
+         + "\(text.count - trimmed.count) more characters. \(hint)]"
 }
 
 // ---------------------------------------------------------------------------
@@ -92,8 +133,16 @@ struct Tool {
     let run: ([String: Any]) -> (String, Bool)
 }
 
-func str(_ args: [String: Any], _ key: String) -> String? {
-    (args[key] as? String).flatMap { $0.isEmpty ? nil : $0 }
+/// Reads a string argument, accepting common aliases.
+///
+/// Models reach for the names they know: `start`/`end` for a range, `day` for a
+/// date. Rejecting those wastes a whole round trip telling them the name they
+/// should have used — cheaper to accept the obvious synonyms.
+func str(_ args: [String: Any], _ key: String, aliases: [String] = []) -> String? {
+    for k in [key] + aliases {
+        if let v = args[k] as? String, !v.isEmpty { return v }
+    }
+    return nil
 }
 func int(_ args: [String: Any], _ key: String) -> Int? {
     if let i = args[key] as? Int { return i }
@@ -145,7 +194,9 @@ let tools: [Tool] = [
                   "properties": ["date": ["type": "string", "description": "Local date, YYYY-MM-DD."]],
                   "required": ["date"]],
          run: { a in
-             guard let d = str(a, "date") else { return ("Provide a `date` as YYYY-MM-DD.", false) }
+             guard let d = str(a, "date", aliases: ["day", "start", "from"]) else {
+                 return ("Provide a `date` as YYYY-MM-DD.", false)
+             }
              let r = runCLI(["day", d]); return (r.out, r.ok)
          }),
 
@@ -175,6 +226,8 @@ let tools: [Tool] = [
          Pair it with search_screen_history (which gives you a timestamp) or reconstruct_day (which \
          gives you an activity's span). Times are the user's LOCAL time.
 
+         Keep the range tight — an hour reads well, a whole day does not and will be truncated.          Narrow first with search_screen_history or reconstruct_day's activity spans.
+
          The text is OCR, so it arrives as fragments with interface chrome mixed in and occasional \
          garbled words. Read across it and report what it means; do not quote it raw at the user. \
          Digits are the weak point — treat numbers read off the screen as leads, not facts. Where a \
@@ -187,9 +240,11 @@ let tools: [Tool] = [
                   ],
                   "required": ["from"]],
          run: { a in
-             guard let f = str(a, "from") else { return ("Provide `from` as \"YYYY-MM-DD HH:MM\".", false) }
+             guard let f = str(a, "from", aliases: ["start", "begin", "since"]) else {
+                 return ("Provide `from` as \"YYYY-MM-DD HH:MM\".", false)
+             }
              var args = ["text", f]
-             if let t = str(a, "to") { args.append(t) }
+             if let t = str(a, "to", aliases: ["end", "until"]) { args.append(t) }
              let r = runCLI(args); return (r.out, r.ok)
          }),
 
@@ -198,12 +253,21 @@ let tools: [Tool] = [
          Where the user's time actually went over the last N days, by application. Use for "how much \
          time did I spend in Slack this month", "what am I spending my days on".
 
-         For what they were DOING rather than which app was focused, prefer reconstruct_day — it \
-         ranks by window title, which carries the subject.
+         Counts backwards from today only — it takes `days`, not a date range. For a specific day, \
+         use reconstruct_day, which also ranks by what was being DONE rather than which app was \
+         focused, because the window title carries the subject.
          """,
          schema: ["type": "object",
                   "properties": ["days": ["type": "integer", "description": "How many days back. Default 7."]]],
          run: { a in
+             // This tool counts backwards from today; it cannot take a range.
+             // Silently returning the last 7 days when asked about one specific
+             // day is worse than refusing — the caller believes the number.
+             if str(a, "start", aliases: ["from", "begin"]) != nil || str(a, "end", aliases: ["to", "until"]) != nil {
+                 return ("time_by_activity only counts backwards from today, using `days`. "
+                         + "For a specific date or range, use reconstruct_day, which ranks what was "
+                         + "actually worked on and gives each activity its time span.", false)
+             }
              var args = ["apps"]
              if let d = int(a, "days") { args.append(String(d)) }
              let r = runCLI(args); return (r.out, r.ok)
@@ -296,13 +360,16 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
             return errorResponse(id, -32602, "Unknown tool: \(params["name"] as? String ?? "?")")
         }
         let args = params["arguments"] as? [String: Any] ?? [:]
-        let (text, ok) = tool.run(args)
+        let (raw, ok) = tool.run(args)
+        let text = capped(raw, hint: tool.name == "screen_text_in_range"
+                          ? "Ask for a narrower time range — an hour reads well, a whole day does not."
+                          : "Narrow the query or lower the limit.")
 
         // A failed retrieval is reported as an error *result*, not a protocol
         // error: the model should see what went wrong and be able to adjust,
         // rather than the client treating it as a transport fault.
         return ["jsonrpc": "2.0", "id": id ?? NSNull(),
-                "result": ["content": [["type": "text", "text": text.isEmpty ? "(no results)" : text]],
+                "result": ["content": [["type": "text", "text": text]],
                            "isError": !ok]]
 
     default:
