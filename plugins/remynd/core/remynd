@@ -129,14 +129,23 @@ cmd_day() {
   [ -n "$sites" ] && { echo "## Sites"; echo "$sites"; echo; }
 
   echo "## How the day ran"
+  # Bucket by hour, not by title. Grouping on (app,title) with MIN(startedAt)
+  # silently drops any hour in which the user stayed in windows first seen
+  # earlier — the day then appears to have holes it doesn't have.
   remynd_sql "$db" "
-    SELECT datetime(MIN(startedAt),'localtime') t, applicationName, windowTitle
+    SELECT strftime('%H', datetime(startedAt,'localtime')) hr,
+           applicationName, windowTitle,
+           SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) secs
     FROM FocusedWindow
     WHERE id >= $lo AND id < $hi AND windowTitle IS NOT NULL AND windowTitle != ''
-    GROUP BY applicationName, windowTitle ORDER BY t ASC LIMIT 400;" |
+    GROUP BY hr, applicationName, windowTitle
+    ORDER BY hr ASC, secs DESC;" |
   /usr/bin/awk -F"$REMYND_FS" '
 '"$(_remynd_title_awk)"'
-    { hr = substr($1, 12, 2)
+    # hr must be forced to a string. "00" from a field is numeric-looking, and
+    # an uninitialised `last` is numeric 0, so hr != last compares 0 != 0 and
+    # the midnight header silently never prints — merging hour 00 into 09.
+    { hr = "" $1
       t = norm_title($3)
       if (t == "") next
       if (hr != last) { if (last != "") printf "\n"; printf "  %s:00  ", hr; last = hr; n = 0; delete seen }

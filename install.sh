@@ -106,8 +106,13 @@ redact_credentials=1
 
 # Session-start snapshot: how much verbatim screen text to include, and the
 # ceiling for the whole digest.
-session_ocr_minutes=30
-session_budget_tokens=8000
+# How much verbatim screen text to include at session start, and the ceiling
+# for the whole opening digest. Small on purpose: the structural summary is
+# what carries meaning, and the agent can pull detail on demand with /remynd.
+# Raising ocr_minutes to 30 costs ~8k tokens per session for little added
+# accuracy (measured), so keep this low unless you want the firehose.
+session_ocr_minutes=5
+session_budget_tokens=1500
 
 # Per-session ceiling for topping up context, as a percentage of the agent's
 # context window. Past it, updates fall back to activity headlines and say so.

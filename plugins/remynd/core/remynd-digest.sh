@@ -277,8 +277,16 @@ remynd_ocr_since() {
 remynd_cutoff() { /bin/date -u -v-"$1"M '+%Y-%m-%d %H:%M:%S'; }
 
 # Convert a local time string the user typed into the UTC form the DB uses.
+#
+# NOT `date -u -j -f ...`: with -u, BSD date parses the INPUT as UTC as well as
+# formatting the output as UTC, so the conversion silently becomes a no-op and
+# every window shifts by the UTC offset. Parse in local time to an epoch first,
+# then render that epoch as UTC.
 remynd_local_to_utc() {
-  /bin/date -u -j -f '%Y-%m-%d %H:%M:%S' "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null
+  local epoch
+  epoch="$(/bin/date -j -f '%Y-%m-%d %H:%M:%S' "$1" '+%s' 2>/dev/null)" || return 1
+  [ -n "$epoch" ] || return 1
+  /bin/date -u -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null
 }
 
 # Full snapshot — SessionStart (PRD §5.2).
@@ -315,7 +323,7 @@ remynd_digest_full() {
     apps="$(remynd_app_rollup "$db" "$hours_cut")"
     [ -n "$apps" ] && { echo "## Time by app"; echo "$apps"; echo; }
 
-    wins="$(remynd_window_trail "$db" "$hours_cut")"
+    wins="$(remynd_window_trail "$db" "$hours_cut" 5)"
     [ -n "$wins" ] && { echo "## Recently open"; echo "$wins"; echo; }
 
     web="$(remynd_web_trail "$db" "$hours_cut")"
@@ -336,8 +344,14 @@ remynd_digest_full() {
     echo
   fi
 
+  local first last
+  first="$(remynd_sql "$db" "SELECT date(datetime(firstSeenAt,'localtime')) FROM OCRTextSegment ORDER BY id ASC LIMIT 1;")"
+  last="$(remynd_sql "$db" "SELECT date(datetime(firstSeenAt,'localtime')) FROM OCRTextSegment ORDER BY id DESC LIMIT 1;")"
   echo "---"
-  echo "Ask \`/remynd\` to search further back or reconstruct a specific day."
+  if [ -n "$first" ] && [ -n "$last" ]; then
+    echo "This is only the last couple of hours. Recorded history runs $first to $last."
+  fi
+  echo "For anything older, ask /remynd — e.g. \`remynd day <YYYY-MM-DD>\`, \`remynd search \"<text>\"\`."
 }
 
 # Delta — UserPromptSubmit (PRD §5.3).
@@ -507,6 +521,11 @@ remynd_activity_rollup() {
     GROUP BY applicationName, windowTitle;" |
   /usr/bin/awk -F"$REMYND_FS" -v limit="$limit" '
 '"$(_remynd_title_awk)"'
+    function head3(t,   a, n) {
+      n = split(t, a, " ")
+      if (n < 3) return ""
+      return a[1] " " a[2] " " a[3]
+    }
     function canon(t,   c) {
       c = tolower(t)
       gsub(/[-—|:,]/, " ", c)
@@ -540,6 +559,16 @@ remynd_activity_rollup() {
           if (length(ks[i]) < 10) continue
           if (length(ks[i]) < length(ks[j]) && index(ks[j], ks[i] " ") == 1) {
             secs[ks[i]] += secs[ks[j]]
+            if (length(label[ks[j]]) < length(label[ks[i]])) label[ks[i]] = label[ks[j]]
+            secs[ks[j]] = -1
+            continue
+          }
+          # Same leading three words, same app: terminal titles append the tool
+          # in use ("landing page claude" / "landing page gh claude"), which is
+          # one activity reported under several names.
+          if (head3(ks[i]) != "" && head3(ks[i]) == head3(ks[j])) {
+            secs[ks[i]] += secs[ks[j]]
+            if (length(label[ks[j]]) < length(label[ks[i]])) label[ks[i]] = label[ks[j]]
             secs[ks[j]] = -1
           }
         }

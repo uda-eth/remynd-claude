@@ -57,7 +57,7 @@ fi
 last_event="$(remynd_sql "$db" "SELECT COALESCE(datetime(MAX(firstSeenAt),'localtime'),'') FROM (SELECT firstSeenAt FROM OCRTextSegment ORDER BY id DESC LIMIT 1);")"
 windows_today="$(remynd_sql "$db" "
   SELECT COUNT(*) FROM (SELECT id, startedAt FROM FocusedWindow ORDER BY id DESC LIMIT $REMYND_WIN_TAIL)
-  WHERE startedAt >= '$(/bin/date -u -j -f '%Y-%m-%d %H:%M:%S' "$(/bin/date '+%Y-%m-%d') 00:00:00" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)';")"
+  WHERE startedAt >= '$(remynd_local_to_utc "$(/bin/date '+%Y-%m-%d') 00:00:00")';")"
 
 # Hand-rolled JSON — no jq (PRD §13.3). All values here are numbers or
 # controlled strings, so simple quoting is sufficient.

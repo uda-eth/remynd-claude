@@ -17,9 +17,12 @@ Everything here is **read-only**. The running app owns these files; never write 
 
 ## Use the `remynd` command
 
-The installer put it on your PATH. If `remynd` is not found, try
-`~/.remynd-sync/bin/remynd`, and if that is missing too, the sync is not installed — say so rather
+**Always invoke it by absolute path: `~/.remynd-sync/bin/remynd`.** Your shell is not a login
+shell, so it has not sourced the user's profile and bare `remynd` will usually not resolve. Do not
+waste turns hunting for it. If that path does not exist, the sync is not installed — say so rather
 than guessing at the user's history.
+
+The examples below omit the prefix for readability; use the full path when you run them.
 
 ```bash
 remynd now                      # what they're doing right now
@@ -69,6 +72,13 @@ constructing a confident story from fragments.
 
 If a question is about the user's own past, prefer looking it up here over asking them. That is the
 entire point: they already told their computer, and this is how you read it back.
+
+## Coverage — check before concluding "no data"
+
+The context injected at session start covers only the **last couple of hours**. It is not the extent
+of what exists. Recorded history usually spans weeks. Before telling the user there is no record of
+something, run `~/.remynd-sync/bin/remynd status` (it prints the span) or just query the day — never
+infer absence from the session digest alone.
 
 ## When there's nothing to find
 
