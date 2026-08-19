@@ -57,6 +57,14 @@ you answer "I saw something about this last week but I can't remember where".
   claim the database is local time; they are mistaken. Prefer the command.
 - **OCR is imperfect.** Text is read off pixels, so expect occasional garbled words, and expect
   interface chrome (button labels, menu items) mixed in with real content. Read around it.
+- **A timestamp is when you SAW it, not when it happened.** An inbox reminder about a meeting is
+  stamped when it appeared on screen, which may be days after — or before — the meeting itself.
+  Never report the time you found something as the time it occurred.
+- **Trust the timeline over times printed on the screen.** Clock times inside a calendar grid, an
+  email header or a meeting invite may be in another timezone, may belong to a neighbouring event,
+  or may be a reminder for something else entirely. The authoritative record of when the user was
+  actually doing something is the activity timeline — `remynd day` and `remynd text`. If you quote a
+  time read off the screen, say so and say it is unverified.
 - **Order within a single second is arbitrary** — OCR segments from one frame have the same
   timestamp and no meaningful sequence among themselves.
 - **A gap in the data means the Mac was asleep, locked, or ReMynd was paused** — not that the user

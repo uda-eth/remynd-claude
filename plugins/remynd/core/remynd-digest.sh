@@ -154,7 +154,25 @@ remynd_window_trail() {
     GROUP BY applicationName, windowTitle
     ORDER BY t DESC LIMIT $limit;" |
   /usr/bin/awk -F"$REMYND_FS" '
-    NF { printf "%s  %s — %s\n", substr($3, 12, 5), $1, $2 }'
+'"$(_remynd_title_awk)"'
+    # Dedupe on the normalised title: a search that lands on a repo produces
+    # four near-identical rows ("x - Google Search", "GitHub", "owner/repo: ...")
+    # which are one thing, and four lines of budget for it.
+    NF {
+      t = norm_title($2)
+      if (t == "") next
+      # A search-results title is redundant with the page it led to, which is
+      # already in this list; drop it and keep the destination.
+      if (t ~ /[Gg]oogle [Ss]earch$/) next
+      if (t == "GitHub" || t == "New Tab" || t == "Google") next
+      k = tolower(substr(t, 1, 24))
+      # collapse titles that share their first three words
+      n3 = split(t, w3, " ")
+      if (n3 >= 3) k = tolower(w3[1] " " w3[2] " " w3[3])
+      if (k in seen) next
+      seen[k] = 1
+      printf "%s  %s — %s\n", substr($3, 12, 5), $1, t
+    }'
 }
 
 # Web pages visited, by title.

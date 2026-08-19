@@ -230,6 +230,11 @@ to get a timestamp, then `remynd text` around it to read what was on screen.
 Times shown by `remynd` are local — it converts them for you. The database underneath stores UTC, so
 querying `app.db` directly will silently shift every window by the UTC offset. Use the command.
 
+A timestamp is when the user SAW something, not when it happened — an inbox reminder about a meeting
+is stamped when it appeared on screen. And trust the activity timeline (`remynd day` / `remynd text`)
+over clock times printed inside a calendar grid or email header, which may be in another timezone or
+belong to a different event.
+
 OCR is imperfect, so expect some garbled words and interface chrome mixed in.
 Gaps mean the Mac was asleep, locked, or recording was paused — not that the user did nothing.
 Credential-shaped strings appear as `<redacted>`; that is the redaction working.
