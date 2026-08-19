@@ -92,14 +92,32 @@ ln -sf "$CORE_DIR/remynd" "$BIN_DIR/remynd"
 # Cursor, VS Code and Gemini CLI launch it over stdio; ChatGPT and other
 # off-device agents reach it over HTTP through the user's own tunnel.
 # ---------------------------------------------------------------------------
+# Replace binaries by atomic rename, never by writing over them.
+#
+# Writing into an existing Mach-O in place — which is what `cp` and `curl -o`
+# both do — invalidates the code signature the kernel has already cached for
+# that inode. The file looks fine, `codesign -v` passes, and the process is
+# SIGKILLed the moment it tries to do real work. That cost an afternoon:
+# Claude Desktop reported only "Server disconnected". `mv` swaps the directory
+# entry for a fresh inode and leaves the old one alone.
+install_binary() {
+  local src="$1" dest="$2"
+  [ -f "$src" ] || return 1
+  local tmp="${dest}.new.$$"
+  cp "$src" "$tmp" || return 1
+  chmod +x "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/../../../mcp/remynd-mcp" ]; then
-  cp "$SRC_DIR/../../../mcp/remynd-mcp" "$BIN_DIR/remynd-mcp" 2>/dev/null || true
-  cp "$SRC_DIR/../../../mcp/remynd-remote.sh" "$BIN_DIR/remynd-remote" 2>/dev/null || true
+  install_binary "$SRC_DIR/../../../mcp/remynd-mcp" "$BIN_DIR/remynd-mcp" || true
+  install_binary "$SRC_DIR/../../../mcp/remynd-remote.sh" "$BIN_DIR/remynd-remote" || true
 else
-  curl -fsSL "$REPO_RAW/mcp/remynd-mcp" -o "$BIN_DIR/remynd-mcp" 2>/dev/null || true
-  curl -fsSL "$REPO_RAW/mcp/remynd-remote.sh" -o "$BIN_DIR/remynd-remote" 2>/dev/null || true
+  curl -fsSL "$REPO_RAW/mcp/remynd-mcp" -o "$BIN_DIR/remynd-mcp.new.$$" 2>/dev/null &&
+    { chmod +x "$BIN_DIR/remynd-mcp.new.$$"; mv -f "$BIN_DIR/remynd-mcp.new.$$" "$BIN_DIR/remynd-mcp"; } || true
+  curl -fsSL "$REPO_RAW/mcp/remynd-remote.sh" -o "$BIN_DIR/remynd-remote.new.$$" 2>/dev/null &&
+    { chmod +x "$BIN_DIR/remynd-remote.new.$$"; mv -f "$BIN_DIR/remynd-remote.new.$$" "$BIN_DIR/remynd-remote"; } || true
 fi
-chmod +x "$BIN_DIR/remynd-mcp" "$BIN_DIR/remynd-remote" 2>/dev/null || true
 if [ -x "$BIN_DIR/remynd-mcp" ] && "$BIN_DIR/remynd-mcp" --version >/dev/null 2>&1; then
   ok "MCP server installed ($("$BIN_DIR/remynd-mcp" --version))"
   HAVE_MCP=1
