@@ -41,7 +41,7 @@ Conclusion: the vault is not a production data source, and will not be until the
 The production `app.db` is a richer source than the vault, and it is **continuously written by the
 recorder** — there is no synthesis pass to lag behind, so a live query is never stale by construction.
 
-Measured against the real production profile (1.4 GB, `ReMynd-8JlUWJeAWoN14PLPhPKPCc8SIDo2`):
+Measured against the real production profile (1.4 GB):
 
 | Table | Contents |
 |---|---|
