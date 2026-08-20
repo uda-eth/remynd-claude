@@ -163,17 +163,73 @@ cmd_day() {
       t = norm_title($3)
       if (t == "") next
       if (hr != last) { if (last != "") printf "\n"; printf "  %s:00  ", hr; last = hr; n = 0; delete seen }
-      key = tolower(substr(t, 1, 28))
+      # substr counts BYTES in BSD awk, so a fixed cut lands inside a multibyte
+      # character — "tonyudotong — claude — 120x30" splits an em-dash. awk then
+      # aborts the record with "illegal byte sequence" and echoes a truncated
+      # copy to stderr. Invisible in a terminal, but the MCP merges stderr into
+      # stdout, and one invalid byte made a whole day decode as nothing.
+      # Words never split a character; count in words.
+      nk = split(t, wk, " ")
+      key = tolower(nk >= 4 ? wk[1] " " wk[2] " " wk[3] " " wk[4] : t)
       if (key in seen) next
       seen[key] = 1
       if (n < 4) {
-        d = t
-        if (length(d) > 40) { d = substr(d, 1, 40); sub(/[^ ]*$/, "", d); sub(/ +$/, "", d) }
+        d = ""
+        for (i = 1; i <= nk; i++) {
+          if (i > 1 && length(d " " wk[i]) > 40) break
+          d = (d == "" ? wk[i] : d " " wk[i])
+        }
         printf "%s%s", (n ? "  |  " : ""), d; n++
       }
       else if (n == 4) { printf "  |  ..."; n++ }
     }
     END { if (last != "") printf "\n" }'
+
+  # A day can be split across profiles. Launching the production app while the
+  # dev build is recording hands the recorder over — one profile freezes, the
+  # other picks up — and this command reads ONE profile. The result is a day
+  # with an hours-long hole in it and no hint that the missing hours exist
+  # somewhere else. That is how a Google Meet the user definitely attended can
+  # be absent from "what did I do", which reads as ReMynd not recording.
+  #
+  # Only pays for itself when there IS a hole: no gap, no extra queries.
+  # Only speak when there is something the user does not already know. Every
+  # day has holes — lunch, sleep, a meeting away from the desk — and narrating
+  # those is noise. The one worth saying out loud is a hole that ANOTHER
+  # profile was recording through, because that hole looks identical to "you
+  # did nothing" and is the opposite of it.
+  local gaps this_db
+  gaps="$(remynd_sql "$db" "
+    SELECT DISTINCT CAST(strftime('%H', datetime(startedAt,'localtime')) AS INT)
+    FROM FocusedWindow WHERE id >= $lo AND id < $hi ORDER BY 1;" |
+    /usr/bin/awk '{ h = $1 + 0
+                    # One line per gap: `read a b` consumes a single line, so
+                    # printing the ends separately leaves the second empty.
+                    if (prev != "" && h - prev > 1) print prev + 1, h
+                    prev = h }')"
+  this_db="$db"
+  while read -r gap_lo gap_hi; do
+    [ -n "${gap_lo:-}" ] && [ -n "${gap_hi:-}" ] || continue
+    local from_gap to_gap
+    from_gap="$(remynd_local_to_utc "$(printf '%s %02d:00:00' "$day" "$gap_lo")")" || continue
+    to_gap="$(remynd_local_to_utc "$(printf '%s %02d:00:00' "$day" "$gap_hi")")"   || continue
+    for other in "$HOME/Library/Application Support/Move37/"*/Recordings/app.db; do
+      [ -f "$other" ] || continue
+      [ "$other" = "$this_db" ] && continue
+      local n
+      n="$(remynd_sql_num "$other" "
+        SELECT COUNT(*) FROM FocusedWindow
+        WHERE startedAt >= '$from_gap' AND startedAt < '$to_gap';" 2>/dev/null)"
+      if [ -n "$n" ] && [ "$n" -gt 20 ]; then
+        printf '\nNothing is recorded here between %02d:00 and %02d:00, but another ReMynd\n' "$gap_lo" "$gap_hi"
+        printf 'profile was holding the recorder then — %s.\n' "$(basename "$(dirname "$(dirname "$other")")")"
+        printf 'Those hours happened; this day is partial, not quiet.\n'
+        break
+      fi
+    done
+  done <<EOS
+$gaps
+EOS
 
   echo
   echo "Verbatim screen text for any stretch:  remynd text \"$day HH:MM\" \"$day HH:MM\""

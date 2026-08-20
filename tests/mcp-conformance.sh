@@ -222,5 +222,55 @@ for SPEC in "Claude Desktop:Library/Application Support/Claude/claude_desktop_co
 done
 rm -rf "$CHK"
 
+# ---------------------------------------------------------------------------
+hd "The tool agrees with the CLI it wraps"
+# reconstruct_day reported "No results" for a fully recorded day while the
+# identical CLI command printed 1,703 bytes. The cause was not the database:
+# stdout and stderr shared one pipe, awk had written a byte-truncated warning
+# to stderr, and a strict UTF-8 decode of the merged buffer returned nil for
+# ALL of it. Any disagreement between the two is that class of bug.
+CLI_BIN="$HOME/.remynd-sync/bin/remynd"
+if [ -x "$CLI_BIN" ]; then
+  MISMATCH=""
+  for i in 0 1 2 3 4 5 6 7; do
+    D="$(/bin/date -v-"${i}"d '+%Y-%m-%d')"
+    CLI_LEN="$("$CLI_BIN" day "$D" 2>/dev/null | /usr/bin/wc -c | /usr/bin/tr -d ' ')"
+    MCP_TXT="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"reconstruct_day\",\"arguments\":{\"date\":\"$D\"}}}" \
+      | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["result"]["content"][0]["text"][:40])
+except Exception: print("PARSE-FAIL")')"
+    case "$MCP_TXT" in
+      "No results"*|PARSE-FAIL*)
+        # Only a mismatch if the CLI actually had something to say.
+        [ "${CLI_LEN:-0}" -gt 200 ] && MISMATCH="$MISMATCH $D(cli=${CLI_LEN}B,mcp=empty)" ;;
+    esac
+  done
+  [ -z "$MISMATCH" ] && ok "eight days: reconstruct_day never empty where the CLI has output" \
+                     || bad "tool disagrees with its own CLI on:$MISMATCH"
+else
+  bad "no CLI at $CLI_BIN to compare against"
+fi
+
+# A warning on stderr must never destroy the answer on stdout.
+STUB="$(mktemp -d)"
+cat > "$STUB/remynd" <<'STUBEOF'
+#!/bin/bash
+printf 'the answer survived\n'
+# Exactly what BSD awk emits when a byte-wise cut lands inside a character:
+# a diagnostic ending in half a UTF-8 sequence.
+printf 'fake-tool: illegal byte sequence \xe2\x80\n' >&2
+STUBEOF
+chmod +x "$STUB/remynd"
+OUT="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_status","arguments":{}}}' \
+  | env REMYND_CLI="$STUB/remynd" "$MCP" 2>/dev/null \
+  | /usr/bin/python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["result"]["content"][0]["text"].strip())
+except Exception: print("PARSE-FAIL")')"
+case "$OUT" in
+  *"the answer survived"*) ok "invalid UTF-8 on stderr does not erase stdout" ;;
+  *) bad "stderr destroyed the result: $OUT" ;;
+esac
+rm -rf "$STUB"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

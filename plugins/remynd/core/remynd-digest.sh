@@ -165,10 +165,17 @@ remynd_window_trail() {
       # already in this list; drop it and keep the destination.
       if (t ~ /[Gg]oogle [Ss]earch$/) next
       if (t == "GitHub" || t == "New Tab" || t == "Google") next
-      k = tolower(substr(t, 1, 24))
-      # collapse titles that share their first three words
+      # Collapse titles that share their first three words. The fallback for
+      # shorter titles used to be substr(t, 1, 24) — and substr in BSD awk
+      # counts BYTES, so "tonyudotong — claude — 120x30" got cut through the
+      # middle of an em-dash. awk then aborted that record with "illegal byte
+      # sequence" and echoed a truncated copy of it to stderr, which is invalid
+      # UTF-8. Harmless from a terminal; it cost a whole day through the MCP.
+      # Whole words can never split a character, so key on those instead.
       n3 = split(t, w3, " ")
-      if (n3 >= 3) k = tolower(w3[1] " " w3[2] " " w3[3])
+      if (n3 >= 3)      k = tolower(w3[1] " " w3[2] " " w3[3])
+      else if (n3 == 2) k = tolower(w3[1] " " w3[2])
+      else              k = tolower(t)
       if (k in seen) next
       seen[k] = 1
       printf "%s  %s — %s\n", substr($3, 12, 5), $1, t

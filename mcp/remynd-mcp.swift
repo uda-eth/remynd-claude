@@ -30,6 +30,11 @@ import Network
 /// The app-bundle path is listed first so a copy shipped inside ReMynd.app is
 /// preferred over a stale one a user installed months ago.
 let cliCandidates: [String] = [
+    // An explicit override, first. NSHomeDirectory() ignores an overridden
+    // HOME, so without this there is no way to point the server at a different
+    // CLI — which meant the stdout/stderr handling could not be tested against
+    // a stub, and an unusual install had no escape hatch either.
+    ProcessInfo.processInfo.environment["REMYND_CLI"] ?? "",
     Bundle.main.bundlePath + "/Contents/Resources/remynd",
     NSHomeDirectory() + "/.remynd-sync/core/remynd",
     NSHomeDirectory() + "/.remynd-sync/bin/remynd",
@@ -67,17 +72,38 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     }
     p.environment = env
 
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    p.standardError = pipe
+    // Separate pipes, deliberately.
+    //
+    // These used to be the SAME pipe, so a warning on stderr was spliced into
+    // the middle of the results. BSD awk aborts a record with "illegal byte
+    // sequence" and echoes a byte-truncated copy of it — invalid UTF-8 — which
+    // made the strict decode below return nil for the whole run. A day with
+    // 1,703 bytes of perfectly good output reported "No results", and the
+    // report that followed spent its hypotheses on the database.
+    //
+    // Diagnostics are not data. Keep them apart, and never let one destroy the
+    // other.
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    p.standardOutput = outPipe
+    p.standardError = errPipe
 
     do { try p.run() } catch {
         return ("Could not run the ReMynd CLI: \(error.localizedDescription)", false)
     }
 
     // Read before waiting: a pipe that fills up deadlocks a process that is
-    // still writing to it.
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    // still writing to it. With two pipes that applies to BOTH — draining
+    // stdout while stderr fills would deadlock just as surely, so stderr is
+    // drained on its own thread.
+    var errData = Data()
+    let errLock = NSLock()
+    let drain = Thread {
+        let d = errPipe.fileHandleForReading.readDataToEndOfFile()
+        errLock.lock(); errData = d; errLock.unlock()
+    }
+    drain.start()
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
 
     // Enforce the timeout. It used to be an unused parameter, which meant a
     // wedged query could hang the client forever with no way to tell why.
@@ -89,7 +115,14 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     }
     p.waitUntilExit()
 
-    let text = String(data: data, encoding: .utf8) ?? ""
+    // Lossy on purpose. String(data:encoding:) returns nil for the WHOLE
+    // buffer if a single byte is malformed — one bad byte anywhere and the
+    // answer becomes "no results". Screen history is OCR of arbitrary text;
+    // malformed bytes are a matter of when, not if. Decoding lossily replaces
+    // the bad byte with U+FFFD and keeps the other 1,700.
+    let text = String(decoding: data, as: UTF8.self)
+    for _ in 0..<50 where drain.isExecuting { usleep(10_000) }
+    errLock.lock(); let errText = String(decoding: errData, as: UTF8.self); errLock.unlock()
 
     // Never report emptiness as if it were an answer. An empty result with a
     // zero exit is a real "nothing found"; anything else is a fault, and the
@@ -98,6 +131,14 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
         if p.terminationStatus != 0 {
             return ("The ReMynd CLI failed (exit \(p.terminationStatus)) and produced no output. "
                     + "Command: remynd \(args.joined(separator: " "))", false)
+        }
+        // Distinguish "nothing matched" from "something went wrong and I still
+        // have nothing". Saying "matched nothing" when the CLI was complaining
+        // the whole time is what sent this bug hunting through the database.
+        let complaint = errText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !complaint.isEmpty {
+            return ("No output for: remynd \(args.joined(separator: " ")), but the CLI reported: "
+                    + String(complaint.prefix(400)), false)
         }
         return ("No results for: remynd \(args.joined(separator: " ")). "
                 + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)

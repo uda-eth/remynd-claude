@@ -276,5 +276,25 @@ else
 fi
 rm -rf "$EXDIR"
 
+# ---------------------------------------------------------------------------
+head_ "Multibyte text does not derail a day"
+# substr in BSD awk counts BYTES. A fixed-width cut lands inside a multibyte
+# character — "tonyudotong — claude — 120x30" splits an em-dash — and awk then
+# aborts that record with "illegal byte sequence", echoing a truncated copy to
+# stderr. From a terminal that is invisible: stdout still looks right. Through
+# the MCP, which merged stderr into stdout, one bad byte made a whole day
+# decode as nothing and report "No results".
+BAD_DAYS=""; NON_UTF8=""
+for i in 0 1 2 3 4 5 6 7; do
+  D="$(/bin/date -v-"${i}"d '+%Y-%m-%d')"
+  ERR="$("$CORE/remynd" day "$D" 2>&1 >/dev/null | /usr/bin/head -c 400)"
+  [ -n "$ERR" ] && BAD_DAYS="$BAD_DAYS $D"
+  "$CORE/remynd" day "$D" 2>/dev/null | /usr/bin/iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || NON_UTF8="$NON_UTF8 $D"
+done
+[ -z "$BAD_DAYS" ] && ok "eight days of history produce no stderr" \
+                   || bad "stderr on:$BAD_DAYS — a byte-wise cut through a character"
+[ -z "$NON_UTF8" ] && ok "every day's output is valid UTF-8" \
+                   || bad "invalid UTF-8 on:$NON_UTF8"
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
