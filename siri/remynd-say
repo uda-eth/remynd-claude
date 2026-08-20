@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# remynd-say — one spoken sentence about your screen history.
+#
+# Siri is not an MCP client and cannot be made into one: there is no MCP in
+# macOS 26.5, and App Intents is the only way into Siri. What Siri CAN do is
+# run a Shortcut by name, and a Shortcut on macOS can run a shell script. So
+# this is the shell script.
+#
+# It is deliberately not the CLI. `remynd recent` is written to be READ — a
+# ranked table, an hour-by-hour trail, verbatim OCR. Spoken aloud that is
+# unbearable. This answers in one sentence, because that is the whole budget a
+# voice assistant has before a person stops listening.
+#
+#   remynd-say                     what am I working on
+#   remynd-say "yesterday"         how yesterday went
+#   remynd-say "this week"         where the week went
+#   remynd-say "gmail"             anything else is searched for
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+CLI="${REMYND_CLI:-$HOME/.remynd-sync/bin/remynd}"
+[ -x "$CLI" ] || { echo "ReMynd isn't set up on this Mac."; exit 0; }
+
+# Siri hands over whatever it heard, capitalised and punctuated. Normalise
+# before matching, or "Yesterday." never matches "yesterday".
+q="$(printf '%s' "${*:-}" | tr '[:upper:]' '[:lower:]' | tr -d '?.,!')"
+q="$(printf '%s' "$q" | sed 's/^ *//; s/ *$//')"
+
+# A voice answer that says "no data" when the Mac simply was not recording is
+# the same lie the daily-report worker used to tell. Say which it is.
+fresh="$("$CLI" status 2>/dev/null | awk -F': *' '/Last capture/ {print $2}')"
+[ -n "$fresh" ] || { echo "ReMynd hasn't recorded anything yet."; exit 0; }
+
+# `remynd apps` answers "which app", `remynd day` answers "what were you doing"
+# — different shapes, and the second is the one worth speaking. Both parse the
+# duration out of a fixed-width column, so both get a small awk rather than a
+# clever shared one.
+
+_spoken_duration() {   # 2h05m | 14m → "2 hours 5 minutes" | "14 minutes"
+  /usr/bin/awk -v d="$1" 'BEGIN {
+    h = 0; m = 0;
+    if (match(d, /[0-9]+h/)) h = substr(d, RSTART, RLENGTH-1) + 0;
+    if (match(d, /[0-9]+m/)) m = substr(d, RSTART, RLENGTH-1) + 0;
+    hu = (h == 1 ? " hour" : " hours"); mu = (m == 1 ? " minute" : " minutes");
+    if (h && m) printf "%d%s %d%s", h, hu, m, mu;
+    else if (h)  printf "%d%s", h, hu;
+    else         printf "%d%s", m, mu;
+  }'
+}
+
+say_day() {   # "<label>" <YYYY-MM-DD>
+  local label="$1" date="$2" line n=0 out=""
+  while IFS= read -r line; do
+    # "  2h05m   09:33–19:34  <what>  (App)"
+    case "$line" in [[:space:]]*[0-9]*m*—*|[[:space:]]*[0-9]*m*–*) : ;; *) continue ;; esac
+    local dur what
+    dur="$(printf '%s' "$line" | /usr/bin/awk '{print $1}')"
+    what="$(printf '%s' "$line" | /usr/bin/sed -E 's/^[[:space:]]*[^ ]+[[:space:]]+[^ ]+[[:space:]]+//; s/[[:space:]]*\([^()]*\)[[:space:]]*$//; s/[[:space:]]+$//')"
+    # Titles get long. Skipping the long ones drops the BIGGEST item of the day
+    # — the first thing anyone asking about yesterday wants to hear — so trim at
+    # a word boundary instead. "A | B" is a browser title, not speech: say it
+    # as a pause.
+    [ -n "$what" ] || continue
+    what="$(printf '%s' "$what" | /usr/bin/sed 's/ *| */, /g')"
+    if [ "${#what}" -gt 60 ]; then
+      what="$(printf '%s' "$what" | /usr/bin/awk '{
+        out = "";
+        for (i = 1; i <= NF; i++) {
+          if (length(out) + length($i) + 1 > 60) break;
+          out = out (out == "" ? "" : " ") $i;
+        }
+        print (out == "" ? substr($0, 1, 60) : out);
+      }')"
+    fi
+    n=$((n + 1)); [ "$n" -gt 3 ] && break
+    out="${out}${out:+, then }${what} for $(_spoken_duration "$dur")"
+  done <<EOS
+$("$CLI" day "$date" 2>/dev/null)
+EOS
+  [ -n "$out" ] && echo "$label you worked on $out." || echo "Nothing recorded $label."
+}
+
+say_apps() {   # "<label>" <days>
+  local out
+  out="$("$CLI" apps "$1" 2>/dev/null | /usr/bin/awk '
+      match($0, /[0-9]+h [0-9]+m$/) {
+        d = substr($0, RSTART); n = substr($0, 1, RSTART-1);
+        gsub(/^ +| +$/, "", n);
+        h = d + 0; sub(/^[0-9]+h +/, "", d); m = d + 0;
+        hu = (h == 1 ? " hour" : " hours"); mu = (m == 1 ? " minute" : " minutes");
+        if (h && m) s = h hu " " m mu; else if (h) s = h hu; else s = m mu;
+        if (++k <= 3) printf "%s%s for %s", (k > 1 ? ", then " : ""), n, s;
+      }')"
+  printf '%s' "$out"
+}
+
+case "$q" in
+  ""|"what am i working on"*|"what am i doing"*|"now"*|"right now"*)
+      cur="$("$CLI" now 2>/dev/null | head -1)"
+      app="${cur%% —*}"
+      win="${cur#*— \"}"; win="${win%\"}"
+      # A window title is a path, a row count, a tmux size — none of it speakable.
+      # The app is the honest part; the title only helps when it reads like prose.
+      if [ -n "$app" ] && [ "$app" != "$cur" ]; then
+        printf "You're in %s" "$app"
+        case "$win" in *[a-zA-Z]*) [ "${#win}" -le 60 ] && printf ", on %s" "$win" ;; esac
+        printf ".\n"
+      else
+        echo "Nothing is on screen right now."
+      fi
+      "$CLI" recent 2>/dev/null | awk '
+        /^ *[0-9]+m? +[0-9]{2}:[0-9]{2}/ { n++; if (n<=2) { t=$0; sub(/^ +/,"",t); print "  " t } }' >/dev/null
+      ;;
+  "yesterday"*|*"yesterday"*)
+      say_day "Yesterday" "$(/bin/date -v-1d '+%Y-%m-%d')" ;;
+  "today"*|*"today"*|"this week"*|*"week"*)
+      case "$q" in
+        *week*) w="$(say_apps 7)"; [ -n "$w" ] && echo "This week you were in $w." || echo "Nothing recorded this week." ;;
+        *)      say_day "Today" "$(/bin/date '+%Y-%m-%d')" ;;
+      esac ;;
+  *)
+      # Anything else is a search. Say when it was last on screen, and where.
+      hit="$("$CLI" moments "$q" 1 2>/dev/null | head -1)"
+      if [ -z "$hit" ]; then
+        echo "I couldn't find $q in your screen history."
+      else
+        ts="$(printf '%s' "$hit" | cut -f1)"
+        app="$(printf '%s' "$hit" | cut -f2)"
+        when="$(/bin/date -j -f '%Y-%m-%d %H:%M:%S' "$ts" '+%A at %-I:%M %p' 2>/dev/null || printf '%s' "$ts")"
+        echo "You last saw $q ${app:+in $app }on $when."
+      fi ;;
+esac
