@@ -44,6 +44,12 @@ for two minutes, and your *next* prompt carries that. It never goes stale mid-se
 ReMynd also speaks [MCP](https://modelcontextprotocol.io), so assistants that never touch a terminal
 can use your history too.
 
+**Moments, shown.** Ask "what was that page I had open around 2pm" and the answer can be the
+actual frame: the `show_moment` tool pulls the real pixels for a second of your history out of the
+recording and returns them as an image, captioned with the app, window and exact time. Older
+recordings are encrypted, so the ReMynd app has to be running for those; nothing is copied out of
+your history and nothing is stored. Frames are the raw screen — unlike text, they are not redacted.
+
 **Same-machine clients** — Claude Desktop, Cursor, VS Code, Gemini CLI — are wired up by the
 installer. Restart the app and ask it what you did yesterday.
 

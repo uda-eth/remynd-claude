@@ -21,6 +21,8 @@
 
 import Foundation
 import Network
+import ImageIO
+import UniformTypeIdentifiers
 
 // ---------------------------------------------------------------------------
 // Locating the CLI
@@ -54,10 +56,15 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     guard let cli = locateCLI() else {
         return ("ReMynd's retrieval CLI is not installed. Install it from https://remyndai.com/claude/install.sh", false)
     }
+    return runScript(cli, args, timeout: timeout)
+}
 
+/// Runs one of ReMynd's bash tools (the CLI, or the frame extractor) and
+/// returns its stdout. Same pipe discipline for both — see the comments.
+func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: Bool) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = [cli] + args
+    p.arguments = [script] + args
 
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
@@ -191,6 +198,13 @@ struct Tool {
     /// this gets both: the structured object AND the same object JSON-encoded
     /// in the text content, which is what OpenAI's own reference servers emit.
     var structured: (([String: Any]) -> [String: Any]?)? = nil
+
+    /// Optional: a result made of arbitrary content blocks (text AND images).
+    ///
+    /// `run` returns prose. A moment revealed as pixels is a list of blocks —
+    /// caption, image, caption, image — and the image blocks are what a chat
+    /// client renders inline. Returns (blocks, isError).
+    var content: (([String: Any]) -> ([[String: Any]], Bool))? = nil
 }
 
 /// Reads a string argument, accepting common aliases.
@@ -330,6 +344,171 @@ func momentFetch(_ rawID: String) -> [String: Any]? {
             "metadata": ["source": "remynd-screen-history", "app": app, "window": window, "local_time": ts]]
 }
 
+// ---------------------------------------------------------------------------
+// Revealing a moment as pixels
+//
+// Text answers "what was on screen". It cannot show it. `show_moment` pulls
+// the real frames out of ReMynd's recording for a chosen instant and returns
+// them as image content blocks, so the client renders the actual screen in
+// the chat rather than a description of it.
+//
+// Extraction is not reimplemented here either: it shells into `remynd-vision`
+// (the same extractor the Claude Code hooks use), which resolves the window,
+// honours `sync_exclude` before anything is decoded, and hands back PNGs. This
+// side only re-encodes them as JPEG at chat width, because a 1400px PNG of a
+// screen is half a megabyte and base64 makes it worse; the same frame as JPEG
+// is a fifth of that and reads identically.
+// ---------------------------------------------------------------------------
+
+let visionCandidates = [
+    NSHomeDirectory() + "/.remynd-sync/bin/remynd-vision",
+    "/usr/local/bin/remynd-vision",
+]
+func locateVision() -> String? {
+    visionCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+
+/// The user's kill switch for pixels, separate from text: `vision_enabled=0`
+/// in ~/.remynd-sync/config. Text retrieval keeps working when this is off.
+func visionDisabledByConfig() -> Bool {
+    let cfg = NSHomeDirectory() + "/.remynd-sync/config"
+    guard let text = try? String(contentsOfFile: cfg, encoding: .utf8) else { return false }
+    for line in text.split(separator: "\n") {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("vision_enabled=") {
+            let v = t.dropFirst("vision_enabled=".count).trimmingCharacters(in: .whitespaces)
+            return v == "0" || v.lowercased() == "false" || v.lowercased() == "no"
+        }
+    }
+    return false
+}
+
+let FRAME_MAX_EDGE = 1568        // what a vision model is downscaled to anyway
+let FRAME_JPEG_QUALITY = 0.82
+let FRAME_MAX_COUNT = 4
+
+/// Re-encode a PNG on disk as base64 JPEG no wider than `maxEdge`.
+func jpegBase64(pngPath: String, maxEdge: Int, quality: Double) -> (data: String, width: Int, height: Int, bytes: Int)? {
+    let url = URL(fileURLWithPath: pngPath) as CFURL
+    guard let src = CGImageSourceCreateWithURL(url, nil) else { return nil }
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxEdge,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+    ]
+    guard let img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+            ?? CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+    let out = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+    guard CGImageDestinationFinalize(dest), out.length > 0 else { return nil }
+    return ((out as Data).base64EncodedString(), img.width, img.height, out.length)
+}
+
+private let momentSecondsIn: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+private let momentCaptionOut: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "EEE d MMM, HH:mm:ss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
+/// Parse a local time the model is likely to hand us: "YYYY-MM-DD HH:MM[:SS]",
+/// with a "T" tolerated, or a remynd://moment/ id.
+func parseLocalMoment(_ raw: String) -> Date? {
+    let ts = momentTimestamp(fromID: raw)      // handles T, remynd://, bare minute
+    return momentSecondsIn.date(from: ts)
+}
+
+/// Build the content blocks for one moment. Pure orchestration: extractor →
+/// JPEG → blocks. Every failure is a text block that says what happened, so the
+/// model can react (widen the window, drop the app filter) instead of guessing.
+func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
+    // A bad argument or a missing extractor is an error the model should react
+    // to; "nothing recorded there" is a clean answer, not an error.
+    func fail(_ msg: String, isError: Bool = true) -> ([[String: Any]], Bool) { ([["type": "text", "text": msg]], isError) }
+
+    guard let atRaw = str(a, "at", aliases: ["time", "timestamp", "when", "moment", "id"]) else {
+        return fail("Provide `at` as a local time, \"YYYY-MM-DD HH:MM:SS\" — take it from a search_screen_history or reconstruct_day result.")
+    }
+    guard let at = parseLocalMoment(atRaw) else {
+        return fail("Could not read `at` = \"\(atRaw)\". Use local time as \"YYYY-MM-DD HH:MM:SS\".")
+    }
+    if visionDisabledByConfig() {
+        return fail("Screen frames are switched off in ReMynd's agent settings (vision_enabled=0). Text retrieval still works; the user can turn frames on in ~/.remynd-sync/config.")
+    }
+    guard let vision = locateVision() else {
+        return fail("This ReMynd install has no frame extractor (remynd-vision), so moments can only be described, not shown. Install it from https://remyndai.com/claude/install.sh")
+    }
+
+    let halfWindow = max(5, min(600, int(a, "window_seconds") ?? 30))
+    let count = max(1, min(FRAME_MAX_COUNT, int(a, "max_frames") ?? 2))
+    let app = str(a, "app", aliases: ["application"])
+
+    let outDir = NSTemporaryDirectory() + "remynd-mcp-frames-\(ProcessInfo.processInfo.processIdentifier)-\(Int(Date().timeIntervalSince1970))"
+    defer { try? FileManager.default.removeItem(atPath: outDir) }
+
+    let from = momentSecondsIn.string(from: at.addingTimeInterval(-Double(halfWindow)))
+    let to   = momentSecondsIn.string(from: at.addingTimeInterval(Double(halfWindow)))
+    var args = ["--from", from, "--to", to, "--max", String(count),
+                "--width", String(FRAME_MAX_EDGE), "--prefer", count == 1 ? "even" : "motion",
+                "--all-apps", "--out", outDir, "--json"]
+    if let app = app, !app.isEmpty { args += ["--app", app] }
+
+    let r = runScript(vision, args, timeout: 60)
+    guard r.ok, let data = r.out.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return fail("The frame extractor did not return a manifest for \(from) – \(to). " + String(r.out.prefix(300)))
+    }
+    let frames = (obj["frames"] as? [[String: Any]]) ?? []
+    if frames.isEmpty {
+        var why = "No recorded frames within ±\(halfWindow)s of \(momentSecondsIn.string(from: at))"
+        if let app = app, !app.isEmpty { why += " while \(app) was frontmost" }
+        if let note = obj["note"] as? String, !note.isEmpty { why += " (\(note))" }
+        why += ". ReMynd may have been paused, the Mac asleep, or the app excluded from agent access. Try a wider window_seconds, drop the app filter, or check sync_status."
+        return fail(why, isError: false)
+    }
+
+    // One caption per frame, then the frame. The caption carries what the
+    // model needs to talk about the picture — app, window, exact second —
+    // without OCR, which is the point of showing it.
+    var blocks: [[String: Any]] = []
+    var shown = 0
+    var totalBytes = 0
+    for f in frames {
+        guard let path = f["path"] as? String,
+              let jpg = jpegBase64(pngPath: path, maxEdge: FRAME_MAX_EDGE, quality: FRAME_JPEG_QUALITY) else { continue }
+        let when = (f["time"] as? String).flatMap { momentSecondsIn.date(from: $0) }.map { momentCaptionOut.string(from: $0) }
+                   ?? (f["time"] as? String ?? "")
+        let appName = (f["app"] as? String) ?? ""
+        var window = ""
+        if let t = f["time"] as? String {
+            let m = runCLI(["moment", t], timeout: 10)
+            if m.ok, let nl = m.out.firstIndex(of: "\n") {
+                let head = String(m.out[m.out.startIndex..<nl]).components(separatedBy: "\t")
+                if head.count >= 2 { window = head[1] }
+            }
+        }
+        let what = window.isEmpty ? appName : (appName.isEmpty ? window : "\(appName) — \(window)")
+        blocks.append(["type": "text", "text": "\(what.isEmpty ? "Screen" : what) · \(when)"])
+        blocks.append(["type": "image", "data": jpg.data, "mimeType": "image/jpeg"])
+        shown += 1
+        totalBytes += jpg.bytes
+    }
+    guard shown > 0 else {
+        return fail("Frames were found for \(from) – \(to) but none could be decoded. Try again, or check that ReMynd's recording is readable.")
+    }
+    let trailer = "\(shown) frame\(shown == 1 ? "" : "s") from the user's own screen recording, \(from) – \(to) local. "
+        + "These are the real pixels that were on screen; describe what is visible and point the user at it."
+    blocks.append(["type": "text", "text": trailer])
+    return (blocks, false)
+}
+
 let tools: [Tool] = [
 
     Tool(name: "search_screen_history",
@@ -342,8 +521,9 @@ let tools: [Tool] = [
          Returns timestamped matches, most recent first. IMPORTANT: a timestamp records when the \
          text was ON SCREEN, not when the underlying event happened — an emailed reminder about a \
          meeting is stamped when it was read. Treat a match as a cursor: take a promising timestamp \
-         and call screen_text_in_range around it to read what was actually there. If a search \
-         returns nothing, try fewer or different words before concluding it never happened.
+         and call screen_text_in_range around it to read what was actually there, or show_moment to \
+         reveal the screen itself. If a search returns nothing, try fewer or different words before \
+         concluding it never happened.
          """,
          schema: ["type": "object",
                   "properties": [
@@ -499,6 +679,36 @@ let tools: [Tool] = [
              return momentFetch(raw)
          }),
 
+    Tool(name: "show_moment",
+         description: """
+         Reveal an exact moment from the user's screen as the real frames — the actual pixels that \
+         were on their screen at that second, returned as images you and the user both see. Text \
+         tells them what was there; this shows them.
+
+         Use it once you have located the moment with search_screen_history, reconstruct_day or \
+         screen_text_in_range: pass that result's local timestamp as `at`. Reach for it whenever the \
+         answer IS a specific thing they saw — a page, a message, a design, a chart, an error dialog, \
+         a photo, a slide — or when the OCR is too garbled to answer from. Don't scatter frames across \
+         a broad summary; reveal the one or two moments that answer the question.
+
+         Frames come from a ±window around `at` (default 30 seconds, 2 frames). Pass `app` to keep to \
+         the application in question when several were on screen. Nothing is written to the user's \
+         history; apps the user excluded from agent access are never shown. Recordings older than \
+         the current hour are encrypted and need the ReMynd app to be running. A frame is the raw \
+         screen: unlike text results, secrets visible in it are not redacted, so don't read \
+         passwords or keys out of a frame back to the user.
+         """,
+         schema: ["type": "object",
+                  "properties": [
+                     "at": ["type": "string", "description": "Local time of the moment, \"YYYY-MM-DD HH:MM:SS\" (a bare HH:MM is accepted). Take it from a search or day result."],
+                     "app": ["type": "string", "description": "Optional. Only frames while this app was frontmost (substring match, e.g. \"Chrome\", \"Slack\")."],
+                     "window_seconds": ["type": "integer", "description": "Optional. Seconds either side of `at` to look in. Default 30, max 600."],
+                     "max_frames": ["type": "integer", "description": "Optional. How many frames to return, 1–4. Default 2."]
+                  ],
+                  "required": ["at"]],
+         run: { _ in ("show_moment returns image content; this client did not request it.", false) },
+         content: showMomentContent),
+
     Tool(name: "sync_status",
          description: """
          What ReMynd has recorded and how fresh it is: which profile is being read, how far back the \
@@ -516,7 +726,7 @@ let tools: [Tool] = [
 // ---------------------------------------------------------------------------
 
 let SERVER_NAME = "remynd"
-let SERVER_VERSION = "1.0.0"
+let SERVER_VERSION = "1.1.0"
 let SUPPORTED_PROTOCOLS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 let DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -562,6 +772,11 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
                     done on this Mac, searchable. Reach for these tools whenever a question is about \
                     the user's own past rather than general knowledge. Prefer looking it up over \
                     asking them: they already told their computer, and this is how you read it back.
+
+                    When the answer is a specific moment — something they saw, a screen, a message, \
+                    a design, an error — find its timestamp, then reveal it with show_moment so they \
+                    see the actual frame rather than a description of it. One or two moments per \
+                    question; broad summaries stay as text.
                     """
                 ]]
 
@@ -596,6 +811,13 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
                     "result": ["structuredContent": obj,
                                "content": [["type": "text", "text": jsonString(obj)]],
                                "isError": false]]
+        }
+
+        // Tools that answer with pixels return their own content blocks.
+        if let build = tool.content {
+            let (blocks, isError) = build(args)
+            return ["jsonrpc": "2.0", "id": id ?? NSNull(),
+                    "result": ["content": blocks, "isError": isError]]
         }
 
         let (raw, ok) = tool.run(args)

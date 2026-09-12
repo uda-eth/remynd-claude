@@ -118,6 +118,39 @@ else
   curl -fsSL "$REPO_RAW/mcp/remynd-remote.sh" -o "$BIN_DIR/remynd-remote.new.$$" 2>/dev/null &&
     { chmod +x "$BIN_DIR/remynd-remote.new.$$"; mv -f "$BIN_DIR/remynd-remote.new.$$" "$BIN_DIR/remynd-remote"; } || true
 fi
+# ---------------------------------------------------------------------------
+# 1c. Frames — the pixels behind the text.
+#
+# `remynd-vision` turns a time window into PNGs of what was actually on
+# screen; the MCP server's show_moment tool and the Claude Code vision hook
+# both shell into it. The AVFoundation extractor is built here with swiftc
+# when the command line tools exist; without them, moments can still be
+# described, just not shown.
+# ---------------------------------------------------------------------------
+VISION_SRC=""
+if [ -n "$SRC_DIR" ] && [ -d "$SRC_DIR/../../../vision" ]; then
+  VISION_SRC="$SRC_DIR/../../../vision"
+fi
+if [ -n "$VISION_SRC" ]; then
+  mkdir -p "$SYNC_DIR/vision"
+  cp "$VISION_SRC/FrameExtract.swift" "$VISION_SRC/build.sh" "$SYNC_DIR/vision/" 2>/dev/null || true
+  chmod +x "$SYNC_DIR/vision/build.sh" 2>/dev/null || true
+  install_binary "$VISION_SRC/remynd-vision" "$BIN_DIR/remynd-vision" || true
+  cp "$VISION_SRC/remynd-vision-hook.py" "$VISION_SRC/remynd-vision-intro.sh" "$CORE_DIR/" 2>/dev/null || true
+  chmod +x "$CORE_DIR/remynd-vision-intro.sh" 2>/dev/null || true
+  if command -v swiftc >/dev/null 2>&1; then
+    if (cd "$SYNC_DIR/vision" && swiftc -O -o "$BIN_DIR/remynd-frames.new.$$" FrameExtract.swift 2>/dev/null) \
+       && mv -f "$BIN_DIR/remynd-frames.new.$$" "$BIN_DIR/remynd-frames"; then
+      ok "frame extractor built (show_moment can reveal real screen frames)"
+    else
+      rm -f "$BIN_DIR/remynd-frames.new.$$"
+      warn "frame extractor did not build — moments will be described, not shown"
+    fi
+  else
+    warn "no swiftc (install Xcode command line tools) — moments will be described, not shown"
+  fi
+fi
+
 if [ -x "$BIN_DIR/remynd-mcp" ] && "$BIN_DIR/remynd-mcp" --version >/dev/null 2>&1; then
   ok "MCP server installed ($("$BIN_DIR/remynd-mcp" --version))"
   HAVE_MCP=1

@@ -176,6 +176,19 @@ in a sentence instead of half-working.
 | **M7** | Proof pack | Clean-room connect on each supported client, screenshots, transcripts answering real questions |
 | **M8** | Remote (conditional on §3) | User-owned tunnel, per-client revocable tokens, live indicator, scoped consent |
 
+| **M9** | Moments as pixels (**done 2026-09-11**) | `show_moment` returns captioned JPEG image blocks for a local timestamp; reads live `.mov` chunks and HLS-converted chunks (AES-128 key fetched from the running app's loopback server, never from the Keychain); conformance tests cover the error/miss/image shapes |
+
+### M9 notes — what the recording actually looks like
+
+A chunk is a `.mov` only while it is being written. Once closed, ReMynd converts it to HLS:
+`movie-<tier>-WxH.m3u8` at the chunk root, fMP4 segments under `_segs_/`, every segment and the
+init segment AES-128-CBC with one key + IV per chunk. `_segs_/enc.key` is the key wrapped with the
+user's storage key (Keychain `ai.m37.meta.storage`), which is not ours to read. The running app
+serves its own recordings to its player over a loopback HTTP server and hands `enc.key` out
+unwrapped, so the extractor asks the app (ports found with `lsof -c ReMynd`), decrypts only the
+segments a frame needs into a temp fMP4, reads it with AVFoundation, and deletes the temp file.
+Segment durations sum to `frameCount / 60` exactly, so frame N is still at N/60 s.
+
 ## 8. Acceptance criteria
 
 1. A user with ReMynd installed connects Claude Desktop in one click and gets a correct answer to

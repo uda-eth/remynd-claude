@@ -272,5 +272,43 @@ case "$OUT" in
 esac
 rm -rf "$STUB"
 
+# ---------------------------------------------------------------------------
+hd "show_moment reveals pixels, not prose"
+# The tool that turns a timestamp into the real frame. A bad time is an error
+# the model can fix; a time with nothing recorded is a clean miss, not an error.
+R="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+printf '%s' "$R" | grep -q '"name":"show_moment"' && ok "exposes show_moment" || bad "show_moment missing from tools/list"
+
+R="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"show_moment","arguments":{"at":"not a time"}}}')"
+printf '%s' "$R" | grep -q '"isError":true' && ok "unparseable at → isError" || bad "garbage at was not flagged as an error"
+
+R="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"show_moment","arguments":{"at":"2001-01-01 03:00:00"}}}')"
+printf '%s' "$R" | grep -q '"isError":false' && printf '%s' "$R" | grep -q 'No recorded frames' \
+  && ok "a moment with nothing recorded is a clean miss, not an error" \
+  || bad "an empty window was mishandled: $(printf '%s' "$R" | cut -c1-200)"
+
+# Live check: if the recorder captured anything in the last 10 minutes, the
+# frame must come back as an image block with a caption before it.
+if [ -x "$HOME/.remynd-sync/bin/remynd-vision" ]; then
+  AT="$(/bin/date -v-3M '+%Y-%m-%d %H:%M:%S')"
+  R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"show_moment\",\"arguments\":{\"at\":\"$AT\",\"window_seconds\":300,\"max_frames\":1}}}")"
+  SHAPE="$(printf '%s' "$R" | /usr/bin/python3 -c 'import json,sys,base64
+try:
+    c=json.load(sys.stdin)["result"]["content"]
+    imgs=[b for b in c if b["type"]=="image"]
+    if not imgs: print("none:"+c[0]["text"][:80]); sys.exit()
+    i=c.index(imgs[0]); cap=c[i-1]["type"]=="text" if i>0 else False
+    d=base64.b64decode(imgs[0]["data"]); ok=d[:3]==b"\xff\xd8\xff" and imgs[0]["mimeType"]=="image/jpeg"
+    print("image" if ok and cap else "bad", len(d)//1024)
+except Exception as e: print("ERR "+str(e))')"
+  case "$SHAPE" in
+    image*) ok "a recent moment comes back as a captioned JPEG image block (${SHAPE#image })KB)" ;;
+    none:*) ok "no frames in the last 5 min (recorder idle) — explained in words: ${SHAPE#none:}" ;;
+    *) bad "show_moment returned an unexpected shape: $SHAPE" ;;
+  esac
+else
+  ok "remynd-vision not installed here — show_moment image path not exercised"
+fi
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

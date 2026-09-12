@@ -1,0 +1,363 @@
+#!/bin/bash
+# remynd-vision — hand an agent the actual pixels that were on screen.
+#
+# `remynd` answers what was on screen as OCR'd text. That is useless for the
+# things text cannot carry: an animation that stutters, a panel that lands two
+# pixels off, a colour that is wrong, a layout that breaks at a width. This
+# pulls the real frames out of ReMynd's recordings so the agent can look.
+#
+# It resolves a time window, asks app.db which app was actually frontmost, and
+# extracts only the frames from those stretches — so feedback about an app is
+# answered with frames of that app, not of the terminal you typed it into.
+#
+# Read-only. Nothing is ever written into the ReMynd profile.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$SELF_DIR")"
+EXTRACT="$SELF_DIR/remynd-frames"
+CONFIG="$ROOT/config"
+SQLITE="/usr/bin/sqlite3"
+[ -x "$SQLITE" ] || SQLITE="$(command -v sqlite3 2>/dev/null || echo /usr/bin/sqlite3)"
+
+# Terminals and editors are where the agent's own UI lives. Feedback is almost
+# never about them, and their frames are just the conversation reflected back.
+AGENT_APPS="Terminal|iTerm|iTerm2|Ghostty|Alacritty|kitty|WezTerm|Warp|Code|Cursor|Claude"
+
+SINCE="10m"
+FROM=""
+TO=""
+APP=""
+ALL_APPS=0
+MAX=8
+WIDTH=1400
+PREFER="motion"
+OUT=""
+QUALITY="high"
+FORMAT="text"
+
+usage() {
+  cat <<'EOF'
+remynd-vision — extract the real screen frames from ReMynd's recordings
+
+  --since <10m|90s|2h>   window ending now (default 10m)
+  --from "<time>"        explicit start (local, any `date -j` friendly form)
+  --to "<time>"          explicit end (default: now)
+  --app <name>           only while this app was frontmost (substring match)
+  --all-apps             include the terminal/editor the agent runs in
+  --max <N>              most frames to emit (default 8)
+  --width <px>           longest edge (default 1400)
+  --prefer motion|even   motion favours moments the screen was changing
+  --quality high|half|small
+  --out <dir>            where to write PNGs (default: a temp dir)
+  --json                 machine-readable manifest
+
+Examples
+  remynd-vision --since 5m                    what was on screen just now
+  remynd-vision --since 3m --app ReMynd       only the app under test
+  remynd-vision --from "14:05" --to "14:09"   a specific stretch
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift 2 ;;
+    --from) FROM="$2"; shift 2 ;;
+    --to) TO="$2"; shift 2 ;;
+    --app) APP="$2"; shift 2 ;;
+    --all-apps) ALL_APPS=1; shift ;;
+    --max) MAX="$2"; shift 2 ;;
+    --width) WIDTH="$2"; shift 2 ;;
+    --prefer) PREFER="$2"; shift 2 ;;
+    --quality) QUALITY="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    --json) FORMAT="json"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "remynd-vision: unknown option $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------- profile
+
+resolve_profile() {
+  # The config may carry several profile= lines; the last non-empty one wins,
+  # which is how a pinned dev profile overrides the auto-detected default.
+  if [ -f "$CONFIG" ]; then
+    local pinned
+    pinned="$(grep -E '^[[:space:]]*profile=' "$CONFIG" 2>/dev/null \
+              | sed -E 's/^[[:space:]]*profile=//' | grep -v '^[[:space:]]*$' | tail -1)"
+    if [ -n "${pinned:-}" ] && [ -d "$pinned" ]; then printf '%s' "$pinned"; return 0; fi
+  fi
+  local base="$HOME/Library/Application Support/Move37"
+  [ -d "$base" ] || return 1
+  # Newest profile that actually holds recordings.
+  local p
+  while IFS= read -r p; do
+    [ -d "$p/Recordings" ] && { printf '%s' "$p"; return 0; }
+  done < <(ls -1dt "$base"/ReMynd* 2>/dev/null)
+  return 1
+}
+
+# The config promises that apps listed in sync_exclude never reach the agent.
+# That promise matters more here than it does for OCR text: a frame shows the
+# whole window, so an excluded app must be dropped before extraction, not
+# filtered out of the output afterwards. This is enforced even under
+# --all-apps and --app.
+read_excluded() {
+  [ -f "$CONFIG" ] || return 0
+  grep -E '^[[:space:]]*sync_exclude=' "$CONFIG" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*sync_exclude=//' | tail -1
+}
+EXCLUDED="$(read_excluded)"
+
+PROFILE="$(resolve_profile)"
+if [ -z "${PROFILE:-}" ]; then
+  echo "remynd-vision: no ReMynd profile found — is ReMynd installed and recording?" >&2
+  exit 1
+fi
+DB="$PROFILE/Recordings/app.db"
+
+if [ ! -x "$EXTRACT" ]; then
+  echo "remynd-vision: frame extractor missing at $EXTRACT (run: $ROOT/vision/build.sh)" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- window
+
+to_epoch() {
+  # Accepts an epoch, or anything `date -j -f` can be coaxed into parsing.
+  local v="$1"
+  case "$v" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s' "$v"; return 0 ;;
+  esac
+  local today; today="$(date +%Y-%m-%d)"
+  local fmt
+  for fmt in "%Y-%m-%d %H:%M:%S" "%Y-%m-%d %H:%M" "%H:%M:%S" "%H:%M"; do
+    local candidate="$v"
+    case "$fmt" in
+      "%H:%M:%S"|"%H:%M") candidate="$today $v"; fmt="%Y-%m-%d $fmt" ;;
+    esac
+    local e
+    e="$(date -j -f "$fmt" "$candidate" +%s 2>/dev/null)" && [ -n "$e" ] && { printf '%s' "$e"; return 0; }
+  done
+  return 1
+}
+
+parse_duration() {
+  # 90s / 10m / 2h / bare number treated as minutes
+  local v="$1" n u
+  n="${v%[smhSMH]}"
+  u="${v#$n}"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  case "$u" in
+    s|S) echo $(( n )) ;;
+    h|H) echo $(( n * 3600 )) ;;
+    m|M|'') echo $(( n * 60 )) ;;
+    *) return 1 ;;
+  esac
+}
+
+NOW="$(date +%s)"
+if [ -n "$TO" ]; then
+  END="$(to_epoch "$TO")" || { echo "remynd-vision: cannot parse --to '$TO'" >&2; exit 2; }
+else
+  END="$NOW"
+fi
+
+if [ -n "$FROM" ]; then
+  START="$(to_epoch "$FROM")" || { echo "remynd-vision: cannot parse --from '$FROM'" >&2; exit 2; }
+else
+  SECS="$(parse_duration "$SINCE")" || { echo "remynd-vision: cannot parse --since '$SINCE'" >&2; exit 2; }
+  START=$(( END - SECS ))
+fi
+
+if [ "$END" -le "$START" ]; then
+  echo "remynd-vision: empty time window" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------- app ranges
+
+# app.db stores UTC. strftime returns text, so cast before any numeric use —
+# comparing text to integers in SQLite silently does the wrong thing.
+focus_rows() {
+  # Pull a little before the window so the span that was already in progress
+  # when the window opened is included.
+  local lookback=$(( START - 7200 ))
+  "$SQLITE" -readonly -noheader -separator '|' "file:$DB?mode=ro" "
+    SELECT CAST(strftime('%s', startedAt) AS INTEGER),
+           CAST(strftime('%s', COALESCE(endedAt, datetime('now'))) AS INTEGER),
+           COALESCE(applicationName,'')
+    FROM FocusedWindow
+    WHERE startedAt IS NOT NULL
+      AND CAST(strftime('%s', startedAt) AS INTEGER) <= $END
+      AND CAST(strftime('%s', startedAt) AS INTEGER) >= $lookback
+    ORDER BY startedAt;" 2>/dev/null |
+  awk -F'|' -v end="$END" '
+    # A focus row whose endedAt is NULL is only genuinely open if nothing
+    # focused after it. The table carries stale NULLs going back months, and
+    # left alone each one becomes a span covering every window since — which
+    # mislabels frames and defeats the app filter entirely. Clamping every
+    # row to the start of the next one rebuilds a sane, non-overlapping
+    # timeline whatever the table says.
+    NF >= 3 { s[n] = $1 + 0; e[n] = $2 + 0; a[n] = $3; n++ }
+    END {
+      for (i = 0; i < n; i++) {
+        stop = e[i]
+        if (i + 1 < n && s[i+1] < stop) stop = s[i+1]
+        if (stop > end) stop = end
+        if (stop <= s[i]) continue
+        print s[i] "|" stop "|" a[i]
+      }
+    }'
+}
+
+ROWS="$(focus_rows)"
+
+# Build the ranges to extract from, clipped to the window and merged when they
+# butt up against each other. Falls back to the whole window if app.db has
+# nothing to say (a fresh install, or a gap in recording).
+build_ranges() {
+  local filter_mode="$1"   # exclude-agent | only-app | none
+  printf '%s\n' "$ROWS" | awk -F'|' -v s="$START" -v e="$END" \
+      -v mode="$filter_mode" -v agents="$AGENT_APPS" -v want="$APP" \
+      -v excluded="$EXCLUDED" '
+    function lower(x) { return tolower(x) }
+    function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+    BEGIN {
+      n = 0
+      split(agents, A, "|")
+      nx = split(excluded, X, ",")
+    }
+    NF < 3 { next }
+    {
+      a = $1 + 0; b = $2 + 0; app = $3
+      if (a < s) a = s
+      if (b > e) b = e
+      if (b <= a) next
+
+      # Privacy exclusions come first and are not overridable.
+      for (i = 1; i <= nx; i++) {
+        t = trim(X[i])
+        if (t != "" && index(lower(app), lower(t)) > 0) next
+      }
+
+      if (mode == "exclude-agent") {
+        for (i in A) if (lower(app) == lower(A[i])) next
+      } else if (mode == "only-app") {
+        if (index(lower(app), lower(want)) == 0) next
+      }
+
+      # Merge across a small gap so one range does not shatter into dozens.
+      if (n > 0 && a - hi[n] <= 3) { if (b > hi[n]) hi[n] = b; next }
+      n++; lo[n] = a; hi[n] = b
+    }
+    END {
+      out = ""
+      for (i = 1; i <= n; i++) {
+        # A sub-second sliver holds no frame worth decoding.
+        if (hi[i] - lo[i] < 1) continue
+        out = out (out == "" ? "" : ",") lo[i] ":" hi[i]
+      }
+      print out
+    }'
+}
+
+MODE="exclude-agent"
+NOTE=""
+if [ -n "$APP" ]; then
+  MODE="only-app"
+elif [ "$ALL_APPS" -eq 1 ]; then
+  MODE="none"
+fi
+
+RANGES="$(build_ranges "$MODE")"
+
+# If filtering left nothing, say so and widen rather than returning silence.
+if [ -z "$RANGES" ] && [ "$MODE" = "only-app" ]; then
+  echo "remynd-vision: '$APP' was never frontmost in that window" >&2
+  RANGES="$(build_ranges none)"
+  NOTE="no frames of '$APP'; showing whatever was on screen instead"
+fi
+if [ -z "$RANGES" ] && [ "$MODE" = "exclude-agent" ]; then
+  RANGES="$(build_ranges none)"
+  NOTE="only the terminal was frontmost; showing it"
+fi
+if [ -z "$RANGES" ]; then
+  RANGES="$START:$END"
+fi
+
+# ---------------------------------------------------------------- extract
+
+if [ -z "$OUT" ]; then
+  OUT="${TMPDIR:-/tmp}/remynd-vision/$(date +%Y%m%d-%H%M%S)-$$"
+fi
+mkdir -p "$OUT" || { echo "remynd-vision: cannot create $OUT" >&2; exit 1; }
+
+MANIFEST="$("$EXTRACT" \
+  --profile "$PROFILE" \
+  --ranges "$RANGES" \
+  --max "$MAX" \
+  --width "$WIDTH" \
+  --quality "$QUALITY" \
+  --prefer "$PREFER" \
+  --out "$OUT" \
+  --json 2>/dev/null)"
+
+if [ -z "$MANIFEST" ]; then
+  echo "remynd-vision: the extractor returned nothing" >&2
+  exit 1
+fi
+
+# Attach the frontmost app to each frame so the agent knows what it is looking at.
+export MANIFEST OUT NOTE FORMAT ROWS
+python3 - <<'PY'
+import json, os, sys
+
+manifest = json.loads(os.environ["MANIFEST"])
+frames = manifest.get("frames", [])
+note = os.environ.get("NOTE", "")
+if not manifest.get("frames") and manifest.get("reason"):
+    note = (note + " " if note else "") + manifest["reason"]
+
+# Frontmost-app timeline, so each frame can be labelled with its app.
+spans = []
+for line in os.environ.get("ROWS", "").splitlines():
+    parts = line.split("|")
+    if len(parts) < 3:
+        continue
+    try:
+        spans.append((int(parts[0]), int(parts[1]), parts[2]))
+    except ValueError:
+        continue
+
+def app_at(epoch):
+    for a, b, name in spans:
+        if a <= epoch <= b:
+            return name
+    return ""
+
+for f in frames:
+    f["app"] = app_at(f["epoch"])
+
+if os.environ.get("FORMAT") == "json":
+    print(json.dumps({"frames": frames, "note": note,
+                      "considered": manifest.get("considered", 0),
+                      "deduped": manifest.get("deduped", 0)}, indent=2))
+    sys.exit(0)
+
+if not frames:
+    reason = manifest.get("reason", "no distinct frames in that window")
+    print(f"No frames: {reason}")
+    sys.exit(0)
+
+if note:
+    print(f"note: {note}")
+print(f"{len(frames)} frame(s) — {manifest.get('considered', 0)} captured, "
+      f"{manifest.get('deduped', 0)} dropped as near-identical\n")
+for f in frames:
+    app = f"  [{f['app']}]" if f["app"] else ""
+    print(f"{f['time']}{app}\n  {f['path']}")
+PY
