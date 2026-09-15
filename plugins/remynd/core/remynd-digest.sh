@@ -340,8 +340,8 @@ remynd_digest_full() {
     # Lead with WHAT, not WHERE. "Google Chrome 34m" is an accounting answer;
     # the subject lives in the window title.
     local wlo whi acts
-    wlo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$hours_cut")"
-    whi="$(remynd_max_window_id "$db")"; whi=$(( whi + 1 ))
+    # time bounds (rowids stopped being monotonic with time on 2026-09-10)
+    wlo="$hours_cut"; whi="9999-12-31 00:00:00"
     acts="$(remynd_activity_rollup "$db" "$wlo" "$whi" 8)"
     [ -n "$acts" ] && { echo "## What you've been working on (last 2h)"; echo "$acts"; echo; }
 
@@ -542,7 +542,7 @@ remynd_activity_rollup() {
            substr(datetime(MIN(startedAt),'localtime'),12,5),
            substr(datetime(MAX(COALESCE(endedAt,startedAt)),'localtime'),12,5)
     FROM FocusedWindow
-    WHERE id >= $lo AND id < $hi
+    WHERE startedAt >= '$lo' AND startedAt < '$hi'
       AND windowTitle IS NOT NULL AND windowTitle != ''
       AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','WindowServer')
     GROUP BY applicationName, windowTitle;" |
@@ -640,8 +640,8 @@ remynd_domains() {
     SELECT u.url, COUNT(*) n
     FROM (SELECT id, webURLId, navigatedToAt FROM WebURLVisit ORDER BY id DESC LIMIT 40000) v
     JOIN WebUrl u ON u.id = v.webURLId
-    WHERE v.navigatedToAt >= (SELECT datetime(startedAt) FROM FocusedWindow WHERE id >= $lo LIMIT 1)
-      AND v.navigatedToAt <  (SELECT datetime(startedAt) FROM FocusedWindow WHERE id >= $hi LIMIT 1)
+    WHERE v.navigatedToAt >= datetime('$lo')
+      AND v.navigatedToAt <  datetime('$hi')
     GROUP BY u.url;" |
   /usr/bin/awk -F"$REMYND_FS" -v limit="$limit" '"'"'
     {

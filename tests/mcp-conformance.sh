@@ -419,5 +419,99 @@ PY
   esac
 fi
 
+# ---------------------------------------------------------------------------
+hd "Calls: what was said, not only what was on screen"
+# ReMynd transcribes call audio into extras.db, which no screen tool can see.
+R="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+for T in list_calls search_calls call_transcript; do
+  printf '%s' "$R" | grep -q "\"name\":\"$T\"" && ok "exposes $T" || bad "$T missing from tools/list"
+done
+
+CLI_CALLS="$HOME/.remynd-sync/bin/remynd"
+if [ -x "$CLI_CALLS" ]; then
+  PICK="$("$CLI_CALLS" calls 30 2>/dev/null | /usr/bin/python3 -c '
+import re, sys
+recs = []
+for line in sys.stdin.read().splitlines():
+    m = re.match(r"^  (\d{4}-\d{2}-\d{2})  .*?(\d+) lines.*\[(\d+)\]\s*$", line)
+    if m:
+        recs.append({"date": m.group(1), "lines": int(m.group(2)), "id": m.group(3), "with": False})
+    elif re.match(r"^  \d{4}-\d{2}-\d{2}  ", line):
+        recs.append({"date": line[2:12], "lines": 0, "id": "", "with": False})
+    elif line.startswith("      with ") and recs:
+        recs[-1]["with"] = True
+spoken = [r for r in recs if r["lines"] > 0]
+bare = [r for r in spoken if not r["with"]]
+if spoken:
+    a = bare[0] if bare else spoken[0]
+    b = max(spoken, key=lambda r: r["lines"])
+    print(a["id"], a["lines"], a["date"], b["id"], b["lines"])
+')"
+  if [ -z "$PICK" ]; then
+    ok "no transcribed calls in the last 30 days — call tools not exercised"
+  else
+    set -- $PICK; A_ID=$1; A_LINES=$2; A_DATE=$3; B_ID=$4
+    # Regression: a call with no participant list came back as "never transcribed",
+    # because bash collapsed the empty tab-separated field and shifted the rest.
+    R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"call_transcript\",\"arguments\":{\"call\":\"$A_ID\"}}}")"
+    TOTAL="$(printf '%s' "$R" | /usr/bin/python3 -c 'import json, re, sys
+t = json.load(sys.stdin)["result"]["content"][0]["text"]
+m = re.search(r"Transcript lines \d+–\d+ of (\d+)", t)
+print(m.group(1) if m else "NONE " + t[:160].replace("\n", " "))')"
+    [ "$TOTAL" = "$A_LINES" ] && ok "call_transcript reads call $A_ID in full ($TOTAL lines, as list_calls reports)" \
+                             || bad "call $A_ID: list_calls says $A_LINES lines, call_transcript gave: $TOTAL"
+
+    PAGE="$(/usr/bin/python3 - "$MCP" "$B_ID" <<'PY'
+import json, re, subprocess, sys
+p = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+def call(args, i):
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "call_transcript", "arguments": args}}) + "\n")
+    p.stdin.flush()
+    return json.loads(p.stdout.readline())["result"]["content"][0]["text"]
+try:
+    t1 = call({"call": sys.argv[2]}, 1)
+    m = re.search(r"offset: (\d+)", t1)
+    if not m:
+        print("single %d" % len(t1))
+    else:
+        off = int(m.group(1))
+        t2 = call({"call": sys.argv[2], "offset": off}, 2)
+        m2 = re.search(r"Transcript lines (\d+)–", t2)
+        print("paged %d %s %d" % (off, m2.group(1) if m2 else "0", len(t1)))
+except Exception as e:
+    print("ERR " + repr(e))
+finally:
+    p.kill()
+PY
+)"
+    case "$PAGE" in
+      single*) ok "call_transcript: the longest recent call fits one page (${PAGE#single } chars)" ;;
+      paged*) set -- $PAGE
+              if [ "$3" = "$(( $2 + 1 ))" ] && [ "$4" -le 24000 ]; then
+                ok "call_transcript pages a long call: page 2 starts at line $3, page 1 is $4 chars"
+              else bad "call_transcript paging broken: $PAGE"; fi ;;
+      *) bad "call_transcript paging check failed: $PAGE" ;;
+    esac
+
+    R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_calls\",\"arguments\":{\"date\":\"$A_DATE\"}}}")"
+    ONLY="$(printf '%s' "$R" | A_DATE="$A_DATE" /usr/bin/python3 -c 'import json, os, re, sys
+t = json.load(sys.stdin)["result"]["content"][0]["text"]
+dates = set(re.findall(r"^  (\d{4}-\d{2}-\d{2})  ", t, re.M))
+print("ok" if dates == {os.environ["A_DATE"]} else "got %s" % sorted(dates))')"
+    [ "$ONLY" = ok ] && ok "list_calls date: returns only $A_DATE" || bad "list_calls date filter: $ONLY"
+
+    R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"reconstruct_day\",\"arguments\":{\"date\":\"$A_DATE\"}}}")"
+    printf '%s' "$R" | grep -q "Calls recorded that day" && printf '%s' "$R" | grep -q "$A_ID" \
+      && ok "reconstruct_day $A_DATE names that day's calls, including $A_ID" \
+      || bad "reconstruct_day $A_DATE does not surface its calls"
+
+    R="$(drive '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_calls","arguments":{"query":"storage-settings: \"cloud\"","limit":3}}}')"
+    printf '%s' "$R" | /usr/bin/python3 -c 'import json, sys
+r = json.load(sys.stdin)["result"]
+sys.exit(0 if not r["isError"] and r["content"][0]["text"].strip() else 1)' \
+      && ok "search_calls survives punctuation that is FTS syntax" || bad "search_calls failed on punctuation"
+  fi
+fi
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

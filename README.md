@@ -56,6 +56,11 @@ each frame out at the width of the chat, captioned, with click-to-enlarge. Clien
 still get the frames as ordinary image results. `tests/viewer-harness.cjs` renders the view in real
 Chrome the way a host does (`NODE_PATH=<dir with playwright> node tests/viewer-harness.cjs <out> mcp/remynd-mcp`).
 
+**Calls, heard.** ReMynd transcribes call audio on the Mac, and the MCP server reads it back:
+`list_calls` (by day or look-back), `search_calls` (what was said, across every call) and
+`call_transcript` (one call, diarized, paged for long meetings, or just the minutes you ask for).
+`reconstruct_day` lists that day's calls at the top, because the screen history cannot hear.
+
 **Same-machine clients** — Claude Desktop, Cursor, VS Code, Gemini CLI — are wired up by the
 installer. Restart the app and ask it what you did yesterday.
 

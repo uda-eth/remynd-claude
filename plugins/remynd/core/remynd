@@ -51,12 +51,20 @@ remynd — your own screen history, on the command line
   remynd status                  sync state, profile, freshness
   remynd refresh                 rebuild the cached digest now
 
+Calls — what was said, not what was on screen
+  remynd calls [days]            calls recorded and transcribed (default 14)
+  remynd call <id|last|fragment> one call in full, diarized
+  remynd call <id> --audio       path to that call's audio file
+  remynd heard <query> [n]       full-text search across call transcripts
+
 Times are LOCAL. Everything is read-only.
 
 Examples
   remynd search "stripe webhook"
   remynd day 2026-08-13
   remynd text "2026-08-13 23:30" "2026-08-13 23:45"
+  remynd heard "permissible purpose"
+  remynd call last
 USAGE
 }
 
@@ -121,8 +129,11 @@ cmd_day() {
   local from_utc to_utc lo hi olo ohi redact
   from_utc="$(remynd_local_to_utc "$day 00:00:00")"  || die "bad date: $day"
   to_utc="$(remynd_local_to_utc "$next 00:00:00")"   || die "bad date: $day"
-  lo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$from_utc")"
-  hi="$(remynd_id_at_time "$db" FocusedWindow startedAt "$to_utc")"
+  # Time bounds, not id bounds: after the 2026-09-10 container merge the
+  # rowids are NOT monotonic with time (history blocks live at 100M/200M/250M,
+  # the CI build's rows at 300M+, the live tail at 600M+). FocusedWindow has an
+  # index on startedAt, so a time predicate is the fast path anyway.
+  lo="$from_utc"; hi="$to_utc"
   redact="$(remynd_config_get redact_credentials 1)"
 
   echo "# $day ($(/bin/date -j -f '%Y-%m-%d' "$day" '+%A' 2>/dev/null))"
@@ -151,7 +162,7 @@ cmd_day() {
            applicationName, windowTitle,
            SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) secs
     FROM FocusedWindow
-    WHERE id >= $lo AND id < $hi AND windowTitle IS NOT NULL AND windowTitle != ''
+    WHERE startedAt >= '$lo' AND startedAt < '$hi' AND windowTitle IS NOT NULL AND windowTitle != ''
     GROUP BY hr, applicationName, windowTitle
     ORDER BY hr ASC, secs DESC;" |
   /usr/bin/awk -F"$REMYND_FS" '
@@ -201,7 +212,7 @@ cmd_day() {
   local gaps this_db
   gaps="$(remynd_sql "$db" "
     SELECT DISTINCT CAST(strftime('%H', datetime(startedAt,'localtime')) AS INT)
-    FROM FocusedWindow WHERE id >= $lo AND id < $hi ORDER BY 1;" |
+    FROM FocusedWindow WHERE startedAt >= '$lo' AND startedAt < '$hi' ORDER BY 1;" |
     /usr/bin/awk '{ h = $1 + 0
                     # One line per gap: `read a b` consumes a single line, so
                     # printing the ends separately leaves the second empty.
@@ -239,14 +250,14 @@ cmd_apps() {
   local days="${1:-7}" db since
   db="$(remynd_db_path "$(_profile)")"
   since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S')"
-  local lo; lo="$(remynd_id_at_time "$db" FocusedWindow startedAt "$since")"
+  local lo; lo="$since"
   echo "# Time by app, last $days days"
   echo
   remynd_sql "$db" "
     SELECT applicationName,
            CAST(SUM(MAX(0, strftime('%s', COALESCE(endedAt, startedAt)) - strftime('%s', startedAt))) / 60 AS INT) mins
     FROM FocusedWindow
-    WHERE id >= $lo AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
+    WHERE startedAt >= '$lo' AND applicationName IS NOT NULL AND applicationName != '' AND applicationName NOT IN ('loginwindow','ScreenSaverEngine','Window Server','WindowServer')
     GROUP BY applicationName HAVING mins > 0 ORDER BY mins DESC LIMIT 20;" |
   /usr/bin/awk -F"$REMYND_FS" '
     NF { h = int($2/60); m = $2%60; printf "  %-30s %3dh %02dm\n", $1, h, m }'
@@ -259,18 +270,18 @@ cmd_text() {
   redact="$(remynd_config_get redact_credentials 1)"
   case "$from" in *:*:*) ;; *:*) from="$from:00" ;; *) from="$from 00:00:00" ;; esac
   from="$(remynd_local_to_utc "$from")" || die "bad time: $1"
-  lo="$(remynd_id_at_time "$db" OCRTextSegment firstSeenAt "$from")"
+  lo="$from"
   if [ -n "$to" ]; then
     case "$to" in *:*:*) ;; *:*) to="$to:00" ;; *) to="$to 00:00:00" ;; esac
     to="$(remynd_local_to_utc "$to")" || die "bad time: $2"
-    hi="$(remynd_id_at_time "$db" OCRTextSegment firstSeenAt "$to")"
+    hi="$to"
   else
-    hi="$(remynd_max_ocr_id "$db")"; hi=$(( hi + 1 ))
+    hi="9999-12-31 00:00:00"
   fi
 
   remynd_sql "$db" "
     SELECT datetime(firstSeenAt,'localtime'), REPLACE(REPLACE(displayText, char(10), ' '), char(13), ' '), normalizedText
-    FROM OCRTextSegment WHERE id >= $lo AND id < $hi ORDER BY id ASC;" |
+    FROM OCRTextSegment WHERE firstSeenAt >= '$lo' AND firstSeenAt < '$hi' ORDER BY firstSeenAt ASC;" |
   /usr/bin/awk -F"$REMYND_FS" -v doredact="$redact" '
 '"$(_remynd_redact_awk)"'
     { k = $3; if (k == "") k = $2
@@ -309,6 +320,15 @@ cmd_status() {
   echo "Last write:  $(_ago "$age") ago"
   [ -n "$last" ] && echo "Last capture: $last (local time)"
   echo "Redaction:   $([ "$(remynd_config_get redact_credentials 1)" = "1" ] && echo "on (credential-shaped strings)" || echo "OFF")"
+
+  # Calls live in a different database and are merged across every profile, so
+  # they get their own line. Without it, "no calls" and "this build has no
+  # calls" look the same, and only one of them is true.
+  local calls; calls="$(_remynd_call_rows 2>/dev/null |
+    /usr/bin/awk -F'\t' '{ n++; if ($7 + 0 > 0) t++; if (last == "") last = $2; first = $2 }
+      END { if (n) printf "%d recorded, %d transcribed (%s -> %s)", n, t, substr(first,1,10), substr(last,1,10)
+            else printf "none recorded" }')"
+  echo "Calls:       $calls"
   echo "Enabled:     $([ "$(remynd_config_get enabled 1)" = "1" ] && echo yes || echo no)"
   if [ -f "$state/context.md" ]; then
     echo "Cache:       $(remynd_tokens_of_file "$state/context.md") tokens, refreshed $(_ago $(( now - $(stat -f %m "$state/context.md") ))) ago"
@@ -367,7 +387,7 @@ cmd_moments() {
       SELECT h.ts, h.txt,
              (SELECT x.id FROM FocusedWindow x
                WHERE x.startedAt <= h.ts
-               ORDER BY x.id DESC LIMIT 1) AS wid
+               ORDER BY x.startedAt DESC LIMIT 1) AS wid
       FROM hits h
     )
     SELECT COALESCE(t.wid, 0),
@@ -404,7 +424,7 @@ cmd_moment() {
     SELECT COALESCE(applicationName,''), COALESCE(windowTitle,'')
     FROM FocusedWindow
     WHERE startedAt <= '$ts_utc'
-    ORDER BY id DESC LIMIT 1;" |
+    ORDER BY startedAt DESC LIMIT 1;" |
   /usr/bin/awk -F"$REMYND_FS" 'NR==1 { printf "%s\t%s\n", $1, $2 } END { if (NR==0) print "\t" }'
   echo
 
@@ -413,6 +433,266 @@ cmd_moment() {
     || die "bad timestamp: $ts"
   to="$(/bin/date -j -v+"${span}"M -f '%Y-%m-%d %H:%M:%S' "$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
   cmd_text "$from" "$to"
+}
+
+# ---------------------------------------------------------------------------
+# Calls — what you HEARD, not only what you saw.
+#
+# ReMynd's CallMonitor records meeting audio to
+#   <profile>/Recordings/Extras/CallMonitor/call-<id>/audio.m4a
+# and transcribes it on device, with speaker diarization, into a SEPARATE
+# database: <profile>/Recordings/Extras/extras.db (Call + TranscriptionSegment).
+#
+# That database is not app.db, so nothing above can see it. A meeting the user
+# definitely attended is therefore absent from `search`, `day` and `text` — and
+# absence reads as "ReMynd never recorded it" when in fact a full transcript
+# and the audio are both sitting on disk. That is the whole reason these
+# commands exist.
+#
+# Calls are also the worst case for the split-profile problem cmd_day warns
+# about: they are few, they are long, and each one lands in whichever profile
+# held the recorder that hour. Worse, when two builds run at once BOTH
+# transcribe the same meeting, and they do it unevenly — one copy came back
+# with speaker labels, a title and a participant list, the other with 437
+# anonymous lines. So these commands read EVERY profile and merge, ignoring
+# the pinned one, and when two rows describe one meeting they keep the copy
+# that actually knows who was talking.
+# ---------------------------------------------------------------------------
+
+remynd_extras_db_path() { printf '%s/Recordings/Extras/extras.db\n' "$1"; }
+
+_remynd_extras_dbs() {
+  local e
+  for e in "$HOME/Library/Application Support/Move37/"*/Recordings/Extras/extras.db; do
+    [ -f "$e" ] && printf '%s\n' "$e"
+  done
+}
+
+# Every call from every profile, deduped, newest first. Tab-separated:
+#   epoch  start_local  end_local  app  title  participants  lines  speakers  id  secs  extras_db
+_remynd_call_rows() {
+  local since_utc="${1:-0001-01-01 00:00:00}" e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    remynd_sql "$e" "
+      SELECT strftime('%s', c.startDate),
+             datetime(c.startDate,'localtime'),
+             COALESCE(datetime(c.endDate,'localtime'),''),
+             COALESCE(c.appName,''),
+             REPLACE(REPLACE(COALESCE(c.title,''), char(10),' '), char(9),' '),
+             REPLACE(REPLACE(COALESCE(c.participants,''), char(10),' '), char(9),' '),
+             (SELECT COUNT(*)          FROM TranscriptionSegment t WHERE t.callID = c.id),
+             (SELECT COUNT(DISTINCT t.speaker) FROM TranscriptionSegment t
+               WHERE t.callID = c.id AND t.speaker IS NOT NULL AND t.speaker != ''),
+             c.id,
+             CAST(COALESCE(strftime('%s', c.endDate) - strftime('%s', c.startDate), 0) AS INT)
+      FROM Call c
+      WHERE c.startDate >= '$since_utc'
+      ORDER BY c.startDate DESC;" |
+    /usr/bin/awk -F"$REMYND_FS" -v db="$e" \
+      'NF >= 10 && $1 != "" { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                                     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,db }'
+  done < <(_remynd_extras_dbs) |
+  /usr/bin/sort -t"$(printf '\t')" -k1,1nr |
+  /usr/bin/awk -F'\t' -v OFS='\t' '
+    # Richness, in the order it matters to a reader: knowing WHO spoke beats
+    # knowing what the meeting was called, which beats the guest list. Line
+    # count only breaks ties, because a longer transcript of anonymous
+    # "?: ..." lines is not the better copy.
+    function score(spk, title, parts, lines) {
+      return (spk + 0 > 0 ? 4000000 : 0) + (title != "" ? 2000000 : 0) \
+           + (parts != "" ? 1000000 : 0) + (lines + 0)
+    }
+    {
+      s = score($8, $5, $6, $7)
+      for (i = 1; i <= n; i++) {
+        # One meeting, two recorders: the builds start their call timers
+        # seconds to a couple of minutes apart, so match on app plus a
+        # five-minute window rather than on an id neither shares.
+        split(keep[i], k, "\t")
+        if (k[4] == $4 && (k[1] - $1 < 300 && $1 - k[1] < 300)) {
+          if (s > kscore[i]) { keep[i] = $0; kscore[i] = s }
+          next
+        }
+      }
+      n++; keep[n] = $0; kscore[n] = s
+    }
+    END { for (i = 1; i <= n; i++) print keep[i] }'
+}
+
+# "[\"Ann\",\"Bo\"]" -> "Ann, Bo". The column is a JSON array; nothing here
+# needs a parser, and a call with a quote in a name is not worth one.
+_remynd_names_awk() {
+  cat <<'AWKF'
+function names(j,   s) {
+  s = j
+  gsub(/^\[|\]$/, "", s); gsub(/"/, "", s); gsub(/,/, ", ", s); gsub(/  +/, " ", s)
+  return s
+}
+AWKF
+}
+
+cmd_calls() {
+  local days="${1:-14}" since
+  since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || die "bad day count: $days"
+
+  echo "# Calls recorded, last $days days"
+  echo
+  _remynd_call_rows "$since" |
+  /usr/bin/awk -F'\t' '
+'"$(_remynd_names_awk)"'
+    {
+      day = substr($2, 1, 10); from = substr($2, 12, 5)
+      to  = ($3 != "" ? substr($3, 12, 5) : "…")
+      secs = $10 + 0
+      dur = secs > 0 ? sprintf("%dh%02dm", secs/3600, (secs%3600)/60) : "—"
+      sub(/^0h/, "", dur)
+      printf "  %s  %s–%s  %6s  %-8s ", day, from, to, dur, $4
+      if ($7 + 0 == 0) printf "not transcribed"
+      else {
+        printf "%s lines", $7
+        if ($8 + 0 == 1) printf ", 1 speaker (undiarized)"
+        else if ($8 + 0 > 1) printf ", %s speakers", $8
+      }
+      printf "   [%s]\n", $9
+      if ($5 != "") printf "      %s\n", $5
+      if ($6 != "") printf "      with %s\n", names($6)
+      n++
+    }
+    END {
+      if (n == 0) print "  (no calls recorded in that window — try a wider one: remynd calls 90)"
+      else printf "\nFull transcript:  remynd call <id>        Audio file:  remynd call <id> --audio\n"
+    }'
+}
+
+# One call, in full. The selector is an id, `last`, or any fragment of the
+# title, a participant name or the date — whatever the user actually remembers.
+cmd_call() {
+  [ $# -ge 1 ] || die "usage: remynd call <id|last|fragment> [--audio]"
+
+  local want_audio=0 sel=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --audio) want_audio=1 ;;
+      *)       [ -z "$sel" ] && sel="$1" || sel="$sel $1" ;;
+    esac
+    shift
+  done
+  [ -n "$sel" ] || die "usage: remynd call <id|last|fragment> [--audio]"
+
+  local rows; rows="$(_remynd_call_rows)"
+  [ -n "$rows" ] || die "no calls have been recorded on this Mac yet."
+
+  local hits
+  if [ "$sel" = "last" ] || [ "$sel" = "latest" ]; then
+    hits="$(printf '%s\n' "$rows" | /usr/bin/head -1)"
+  else
+    hits="$(printf '%s\n' "$rows" |
+      /usr/bin/awk -F'\t' -v q="$(printf '%s' "$sel" | /usr/bin/tr '[:upper:]' '[:lower:]')" '
+        $9 == q { print; found = 1; exit }
+        { hay = tolower($2 " " $4 " " $5 " " $6)
+          if (index(hay, q)) print }')"
+  fi
+
+  local count; count="$(printf '%s' "$hits" | /usr/bin/grep -c . || true)"
+  if [ "${count:-0}" -eq 0 ]; then
+    die "no call matches \"$sel\". List what there is with: remynd calls 90"
+  fi
+  if [ "${count:-0}" -gt 1 ]; then
+    echo "\"$sel\" matches $count calls — pick one by id:" >&2
+    printf '%s\n' "$hits" |
+      /usr/bin/awk -F'\t' '{ printf "  [%s]  %s  %s  %s\n", $9, $2, $4, ($5 != "" ? $5 : "(untitled)") }' >&2
+    exit 1
+  fi
+
+  local start end app title parts lines spk id db
+  # Not IFS=$'\t': tab is IFS whitespace, so bash collapses a run of tabs and an
+  # empty field (a call with no participants, or no title) shifts every field
+  # after it. A call printed "With: 185", "0 lines, <id> speakers" and then
+  # "never transcribed" while its 185 lines sat in extras.db. The unit
+  # separator is not whitespace, so empty fields survive the split.
+  IFS=$'\037' read -r _ start end app title parts lines spk id _secs db \
+    <<< "$(printf '%s' "$hits" | /usr/bin/tr '\t' '\037')"
+
+  local audio; audio="$(dirname "$(dirname "$db")")/Extras/CallMonitor/call-$id/audio.m4a"
+  if [ "$want_audio" = "1" ]; then
+    [ -f "$audio" ] || die "no audio file kept for call $id (the transcript may still be there: remynd call $id)"
+    printf '%s\n' "$audio"
+    return 0
+  fi
+
+  echo "# ${title:-Untitled call}"
+  echo
+  echo "  $app · $start${end:+ – ${end:11:8}}"
+  [ -n "$parts" ] && printf '  With: %s\n' \
+    "$(printf '%s' "$parts" | /usr/bin/sed 's/^\[//; s/\]$//; s/"//g; s/,/, /g')"
+  printf '  %s lines' "$lines"
+  if [ "${spk:-0}" -eq 1 ]; then printf ', 1 speaker (undiarized — labels are not reliable here)'
+  elif [ "${spk:-0}" -gt 1 ]; then printf ', %s speakers' "$spk"; fi
+  printf '\n'
+  [ -f "$audio" ] && printf '  Audio: %s\n' "$audio"
+  echo
+
+  local redact; redact="$(remynd_config_get redact_credentials 1)"
+  remynd_sql "$db" "
+    SELECT strftime('%H:%M:%S', datetime(startTimestamp,'localtime')),
+           COALESCE(NULLIF(speaker,''), '?'),
+           REPLACE(REPLACE(REPLACE(text, char(10),' '), char(9),' '), char(13),' ')
+    FROM TranscriptionSegment
+    WHERE callID = $id
+    ORDER BY startTimestamp ASC, id ASC;" |
+  /usr/bin/awk -F"$REMYND_FS" -v doredact="$redact" '
+'"$(_remynd_redact_awk)"'
+    NF >= 3 { t = $3; if (t == "") next
+              if (doredact == 1) t = redact(t)
+              printf "%s  %s: %s\n", $1, $2, t; n++ }
+    END { if (n == 0) print "(the audio was recorded but never transcribed — this call has no text)" }'
+}
+
+# Full-text search across everything that was SAID, the counterpart to
+# `remynd search` over everything that was seen.
+cmd_heard() {
+  [ $# -ge 1 ] || die "usage: remynd heard <query> [limit]"
+  local q="$1" limit="${2:-30}" esc redact e printed=0
+  esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
+  redact="$(remynd_config_get redact_credentials 1)"
+
+  # When two builds recorded the same meeting they also transcribed it twice,
+  # so an unfiltered search returns every hit twice in slightly different
+  # words — which reads as two separate calls saying nearly the same thing.
+  # Reuse the merge: keep hits only from the copy `remynd calls` settled on.
+  local keep_ids
+  keep_ids="$(_remynd_call_rows | /usr/bin/awk -F'\t' '{ printf "%s,", $9 }')"
+
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    remynd_sql "$e" "
+      SELECT datetime(s.startTimestamp,'localtime'),
+             COALESCE(NULLIF(s.speaker,''),'?'),
+             COALESCE(NULLIF(c.title,''), c.appName, 'call'),
+             s.callID,
+             REPLACE(REPLACE(REPLACE(s.text, char(10),' '), char(9),' '), char(13),' ')
+      FROM TranscriptionSegment s
+      JOIN TranscriptionSegment_FTS f ON f.rowid = s.id
+      LEFT JOIN Call c ON c.id = s.callID
+      WHERE TranscriptionSegment_FTS MATCH '$esc'
+      ORDER BY s.startTimestamp DESC
+      LIMIT $limit;" |
+    /usr/bin/awk -F"$REMYND_FS" -v OFS='\t' 'NF >= 5 { print $1, $2, $3, $4, $5 }'
+  done < <(_remynd_extras_dbs) |
+  /usr/bin/sort -t"$(printf '\t')" -k1,1r |
+  /usr/bin/awk -F'\t' -v doredact="$redact" -v lim="$limit" -v keep="$keep_ids" '
+'"$(_remynd_redact_awk)"'
+    BEGIN { n_keep = split(keep, kk, ","); for (i = 1; i <= n_keep; i++) if (kk[i] != "") ok[kk[i]] = 1 }
+    { if (!($4 in ok)) next
+      key = $1 " " substr($5, 1, 60)
+      if (key in seen) next
+      seen[key] = 1
+      if (n++ >= lim) exit
+      t = $5; if (doredact == 1) t = redact(t)
+      printf "%s  %s  [%s · %s]\n      %s: %s\n", substr($1,1,10), substr($1,12,5), $3, $4, $2, t }
+    END { if (n == 0) print "(nothing matching was said in any recorded call — try fewer words)"
+          else printf "\nRead one in full:  remynd call <id>\n" }'
 }
 
 cmd_refresh() { "$_here/remynd-refresh.sh" --force && cmd_status; }
@@ -426,6 +706,9 @@ case "${1:-}" in
   day)     shift; cmd_day "$@" ;;
   apps)    shift; cmd_apps "$@" ;;
   text)    shift; cmd_text "$@" ;;
+  calls)   shift; cmd_calls "$@" ;;
+  call)    shift; cmd_call "$@" ;;
+  heard)   shift; cmd_heard "$@" ;;
   status)  shift; cmd_status "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
   ""|-h|--help|help) usage ;;

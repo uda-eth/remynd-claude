@@ -34,6 +34,22 @@ remynd text "2026-08-13 23:30" "2026-08-13 23:45"   # verbatim screen text
 remynd status                   # profile, freshness, whether redaction is on
 ```
 
+## Calls — what was said, not what was on screen
+
+ReMynd also records call audio (Zoom, Meet, Teams) and transcribes it on the Mac, with speaker labels.
+That lives in a separate database the screen commands above cannot see, so a meeting can look
+unrecorded in `remynd day` while its full transcript is on disk. For anything said out loud, use:
+
+```bash
+remynd calls [days]            # calls recorded, with ids, titles, participants (default 14 days)
+remynd call <id|last|fragment> # one call in full, one timestamped line per utterance
+remynd heard "<words>" [n]     # search what was said across every call
+```
+
+Speaker labels are about 85% reliable and names are often misheard, so check a quote against the
+lines around it before attributing it. Never conclude a conversation was not captured from the
+screen commands alone.
+
 ## Choosing a command
 
 | The question | The command |

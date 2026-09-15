@@ -143,7 +143,7 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
             // script's /usr/bin/python3 is an Xcode shim, and the reason was on
             // stderr the whole time.
             return ("\(label) failed (exit \(p.terminationStatus)) and produced no output"
-                    + (complaint.isEmpty ? ". " : ": " + String(complaint.prefix(400)) + " ")
+                    + (complaint.isEmpty ? ". " : ": " + String(complaint.prefix(4000)) + " ")
                     + "Command: \(label) \(args.joined(separator: " "))", false)
         }
         // Distinguish "nothing matched" from "something went wrong and I still
@@ -151,7 +151,7 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
         // the whole time is what sent this bug hunting through the database.
         if !complaint.isEmpty {
             return ("No output for: \(label) \(args.joined(separator: " ")), but it reported: "
-                    + String(complaint.prefix(400)), false)
+                    + String(complaint.prefix(4000)), false)
         }
         return ("No results for: \(label) \(args.joined(separator: " ")). "
                 + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)
@@ -927,6 +927,156 @@ let MOMENT_VIEWER_HTML = #"""
 </html>
 """#
 
+// ---------------------------------------------------------------------------
+// Calls — what was said
+//
+// ReMynd records call audio (Zoom, Meet, Teams…) and transcribes it on the Mac,
+// with speaker diarization, into Recordings/Extras/extras.db. None of it is in
+// app.db, so every screen tool is deaf to it: a meeting looks unrecorded while
+// its full transcript sits on disk. These tools shell into the CLI's `calls`,
+// `call` and `heard`, which also merge the two copies that two running builds
+// make of one meeting.
+// ---------------------------------------------------------------------------
+
+private let callDayFormat: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f
+}()
+
+/// How many days `remynd calls` must look back to cover a whole local date.
+func daysBack(toLocalDate s: String) -> Int? {
+    guard let d = callDayFormat.date(from: String(s.prefix(10))) else { return nil }
+    let cal = Calendar.current
+    let days = cal.dateComponents([.day], from: cal.startOfDay(for: d), to: Date()).day ?? 0
+    return min(3650, max(1, days + 2))
+}
+
+/// `remynd calls` output, one record per call: its line plus the indented lines under it.
+func callRecords(days: Int) -> (records: [String], ok: Bool, raw: String) {
+    let r = runCLI(["calls", String(days)], timeout: 30)
+    var recs: [String] = []
+    for line in r.out.components(separatedBy: "\n") {
+        if line.range(of: #"^  \d{4}-\d{2}-\d{2}  "#, options: .regularExpression) != nil {
+            recs.append(line)
+        } else if line.hasPrefix("      "), !recs.isEmpty {
+            recs[recs.count - 1] += "\n" + line
+        }
+    }
+    return (recs, r.ok, r.out)
+}
+
+/// The CLI's own next-step hints name CLI commands; say the tool names instead.
+func mcpCallWording(_ s: String) -> String {
+    s.replacingOccurrences(of: "Full transcript:  remynd call <id>        Audio file:  remynd call <id> --audio",
+                           with: "Read what was said: call_transcript with call set to the id in brackets. Search every call: search_calls.")
+     .replacingOccurrences(of: "Read one in full:  remynd call <id>",
+                           with: "Read the conversation around a hit: call_transcript with call set to its id and from a minute before the hit.")
+     .replacingOccurrences(of: "remynd calls 90", with: "list_calls with days: 90")
+}
+
+let CALL_PAGE_CHARS = 20_000
+let CALL_CAVEAT = "Speaker labels come from on-device diarization and are about 85% reliable; \"?\" means unlabelled. "
+    + "Names and jargon are often misheard (\"MCP\" can come out as \"NCP\"). "
+    + "Check a quote against the lines around it before attributing it to someone."
+
+func listCallsText(_ a: [String: Any]) -> (String, Bool) {
+    if let date = str(a, "date", aliases: ["day"]) {
+        guard let days = daysBack(toLocalDate: date) else { return ("`date` must be a local date, YYYY-MM-DD.", false) }
+        let c = callRecords(days: days)
+        guard c.ok else { return (mcpCallWording(c.raw), false) }
+        let day = String(date.prefix(10))
+        let hits = c.records.filter { $0.hasPrefix("  \(day)  ") }
+        if hits.isEmpty {
+            return ("No calls were recorded on \(day). A meeting ReMynd did not hear can still show up in reconstruct_day as a Zoom or Meet window.", true)
+        }
+        return ("# Calls on \(day)\n\n" + hits.joined(separator: "\n")
+                + "\n\nRead what was said: call_transcript with call set to the id in brackets.", true)
+    }
+    let days = max(1, min(3650, int(a, "days") ?? 14))
+    let c = callRecords(days: days)
+    return (mcpCallWording(c.raw), c.ok)
+}
+
+/// "10:24", "10:24:05" or "2026-09-14 10:24" → "HH:MM:SS" for comparing transcript lines.
+func normalizeClock(_ raw: String, end: Bool) -> String? {
+    guard let m = raw.range(of: #"\d{1,2}:\d{2}(:\d{2})?"#, options: .regularExpression) else { return nil }
+    var t = String(raw[m])
+    if t.split(separator: ":").count == 2 { t += end ? ":59" : ":00" }
+    if t.split(separator: ":")[0].count == 1 { t = "0" + t }
+    return t
+}
+
+func callTranscriptText(_ a: [String: Any]) -> (String, Bool) {
+    guard let sel = str(a, "call", aliases: ["id", "call_id", "title", "name"]) else {
+        return ("Provide `call`: an id from list_calls or search_calls, \"last\" for the most recent call, or a fragment of its title or a participant's name.", false)
+    }
+    let r = runCLI(["call", sel], timeout: 30)
+    guard r.ok else {
+        // A fragment that matches several calls is a choice to make, not a
+        // failure: hand the model the candidates, most recent first.
+        if let pick = r.out.range(of: "matches ") , r.out.contains("pick one by id") {
+            let list = String(r.out[pick.lowerBound...])
+                .components(separatedBy: " Command: ").first ?? ""
+            return ("\"\(sel)\" " + list.trimmingCharacters(in: .whitespacesAndNewlines)
+                    + "\n\nMost recent first. Call call_transcript again with one id as `call`.", true)
+        }
+        return (mcpCallWording(r.out), false)
+    }
+    let lines = r.out.components(separatedBy: "\n")
+    let isUtterance: (String) -> Bool = { $0.range(of: #"^\d{2}:\d{2}:\d{2}  "#, options: .regularExpression) != nil }
+    guard let first = lines.firstIndex(where: isUtterance) else { return (mcpCallWording(r.out), true) }
+    let header = lines[..<first].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    var body = lines[first...].filter(isUtterance)
+
+    let fromT = str(a, "from", aliases: ["start"]).flatMap { normalizeClock($0, end: false) }
+    let toT = str(a, "to", aliases: ["end"]).flatMap { normalizeClock($0, end: true) }
+    if let f = fromT { body = body.filter { String($0.prefix(8)) >= f } }
+    if let t = toT { body = body.filter { String($0.prefix(8)) <= t } }
+    let ranged = fromT != nil || toT != nil
+    let total = body.count
+    let offset = max(0, int(a, "offset") ?? 0)
+
+    // A call runs 25–45k characters, past what one tool result should carry.
+    // Page it, and say exactly how to get the next page.
+    var text = header + "\n\n"
+    if total == 0 {
+        text += ranged ? "No transcript lines between \(fromT ?? "the start") and \(toT ?? "the end") of this call."
+                       : "This call has no transcript lines."
+    } else if offset >= total {
+        text += "offset \(offset) is past the end: this \(ranged ? "range" : "call") has \(total) transcript lines."
+    } else {
+        var budget = CALL_PAGE_CHARS - header.count - CALL_CAVEAT.count
+        var page: [String] = []
+        var i = offset
+        while i < total {
+            let cost = body[i].count + 1
+            if cost > budget && !page.isEmpty { break }
+            page.append(body[i]); budget -= cost; i += 1
+        }
+        let span = ranged ? " between \(fromT ?? "the start") and \(toT ?? "the end")" : ""
+        text += "Transcript lines \(offset + 1)–\(i) of \(total)\(span):\n\n" + page.joined(separator: "\n")
+        if i < total {
+            text += "\n\n[continues — call call_transcript again with the same call and offset: \(i) for the next page, or narrow it with from/to]"
+        }
+    }
+    return (text + "\n\n" + CALL_CAVEAT, true)
+}
+
+func searchCallsText(_ a: [String: Any]) -> (String, Bool) {
+    guard let raw = str(a, "query", aliases: ["q", "text", "words"]) else { return ("Provide a `query`.", false) }
+    // The transcript index is SQLite FTS. Punctuation there is syntax — a hyphen
+    // or a colon turns into an operator and the query silently matches nothing,
+    // which reads as "never said". Keep words and quoted phrases only.
+    let cleaned = String(raw.map { $0.isLetter || $0.isNumber || $0 == " " || $0 == "\"" ? $0 : " " })
+        .split(separator: " ").joined(separator: " ")
+    guard !cleaned.isEmpty else { return ("Provide words to search for.", false) }
+    let limit = max(1, min(100, int(a, "limit") ?? 20))
+    let r = runCLI(["heard", cleaned, String(limit)], timeout: 30)
+    return (mcpCallWording(r.out), r.ok)
+}
+
 let tools: [Tool] = [
 
     Tool(name: "search_screen_history",
@@ -941,7 +1091,8 @@ let tools: [Tool] = [
          meeting is stamped when it was read. Treat a match as a cursor: take a promising timestamp \
          and call screen_text_in_range around it to read what was actually there, or show_moment to \
          reveal the screen itself. If a search returns nothing, try fewer or different words before \
-         concluding it never happened.
+         concluding it never happened. Words said out loud on calls are not in this index — search \
+         those with search_calls.
          """,
          schema: ["type": "object",
                   "properties": [
@@ -967,7 +1118,8 @@ let tools: [Tool] = [
          screen_text_in_range over that span and read it. A day with no recording says so plainly; \
          that means the Mac was off, asleep or not recording, not that the user did nothing. When your \
          answer describes particular moments from the day, show the headline ones with show_moment in \
-         the same turn.
+         the same turn. Calls recorded that day are listed first with their ids: what was said on \
+         them is in call_transcript, not in the screen history.
          """,
          schema: ["type": "object",
                   "properties": ["date": ["type": "string", "description": "Local date, YYYY-MM-DD."]],
@@ -976,7 +1128,22 @@ let tools: [Tool] = [
              guard let d = str(a, "date", aliases: ["day", "start", "from"]) else {
                  return ("Provide a `date` as YYYY-MM-DD.", false)
              }
-             let r = runCLI(["day", d]); return (r.out, r.ok)
+             let r = runCLI(["day", d])
+             // The day view is built from screen history, which cannot hear. Name
+             // that day's calls up front so a meeting is never read as silence.
+             guard r.ok, let back = daysBack(toLocalDate: d) else { return (r.out, r.ok) }
+             let day = String(d.prefix(10))
+             let calls = callRecords(days: back).records.filter { $0.hasPrefix("  \(day)  ") }
+             guard !calls.isEmpty else { return (r.out, r.ok) }
+             let section = "## Calls recorded that day — audio, transcribed\n\n"
+                 + "The screen history below cannot hear. What was said on these calls is in call_transcript "
+                 + "(call: the id in brackets).\n\n" + calls.joined(separator: "\n")
+             var parts = r.out.components(separatedBy: "\n")
+             if let head = parts.first, head.hasPrefix("# ") {
+                 parts.removeFirst()
+                 return (head + "\n\n" + section + "\n" + parts.joined(separator: "\n"), true)
+             }
+             return (section + "\n\n" + r.out, true)
          }),
 
     Tool(name: "recent_activity",
@@ -1100,6 +1267,65 @@ let tools: [Tool] = [
              return momentFetch(raw)
          }),
 
+    Tool(name: "list_calls",
+         description: """
+         Calls and meetings ReMynd recorded — Zoom, Google Meet, Teams and the like — with the audio \
+         transcribed on the Mac: date, time, length, app, title, participants, how many transcript \
+         lines and speakers, and the call id in brackets. The screen tools cannot hear, so this is \
+         where meetings and conversations live.
+
+         Use for "my calls this week", "the meeting with Ali on Friday", or to find the id for \
+         call_transcript. Pass `date` (local YYYY-MM-DD) for one day, or `days` to look back \
+         (default 14). "not transcribed" means the audio was kept but has no text.
+         """,
+         schema: ["type": "object",
+                  "properties": [
+                     "date": ["type": "string", "description": "Optional. One local day, YYYY-MM-DD."],
+                     "days": ["type": "integer", "description": "Optional. How many days back to list. Default 14."]
+                  ]],
+         run: listCallsText),
+
+    Tool(name: "call_transcript",
+         description: """
+         What was actually said on a call: the diarized transcript, one timestamped line per \
+         utterance with its speaker. Use it for "what did Ali say about pricing", "what did we agree \
+         with Julian", a meeting recap, or anything said out loud.
+
+         Pass `call` as the id from list_calls or search_calls (most reliable), "last" for the most \
+         recent call, or a fragment of the title or a participant's name. A long call comes in \
+         pages: follow the `offset` the result gives, or read just part of it with `from` and `to` \
+         (local clock times within the call). Speaker labels are about 85% reliable and names are \
+         often misheard — check a quote against the surrounding lines before putting a name on it. \
+         To show what was on screen while something was said, call show_moment at that time.
+         """,
+         schema: ["type": "object",
+                  "properties": [
+                     "call": ["type": "string", "description": "Call id (from list_calls/search_calls), \"last\", or a title/participant fragment."],
+                     "from": ["type": "string", "description": "Optional. Local time within the call to start at, e.g. \"10:24\"."],
+                     "to": ["type": "string", "description": "Optional. Local time within the call to stop at."],
+                     "offset": ["type": "integer", "description": "Optional. Transcript line to start from, as given by the previous page."]
+                  ],
+                  "required": ["call"]],
+         run: callTranscriptText),
+
+    Tool(name: "search_calls",
+         description: """
+         Full-text search across every call transcript — words people said out loud, as opposed to \
+         what was on screen. Returns matching lines newest first with the time, speaker, call title \
+         and call id; open the conversation around a hit with call_transcript (that call id, `from` a \
+         minute or two before the hit).
+
+         Words are ANDed; put a phrase in double quotes. Transcription mishears names and jargon, so \
+         try a simpler word or another spelling before concluding it was never said.
+         """,
+         schema: ["type": "object",
+                  "properties": [
+                     "query": ["type": "string", "description": "Words to find in what was said."],
+                     "limit": ["type": "integer", "description": "Max matches. Default 20."]
+                  ],
+                  "required": ["query"]],
+         run: searchCallsText),
+
     Tool(name: "show_moment",
          description: """
          Reveal an exact moment from the user's screen as the real frames — the actual pixels that \
@@ -1168,7 +1394,7 @@ let tools: [Tool] = [
 // ---------------------------------------------------------------------------
 
 let SERVER_NAME = "remynd"
-let SERVER_VERSION = "1.3.0"
+let SERVER_VERSION = "1.4.0"
 let SUPPORTED_PROTOCOLS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 let DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -1236,6 +1462,12 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
                     headline moments. Do this without asking, and never end an answer by offering to \
                     pull frames. Skip frames only for pure numbers (time per app, counts), when \
                     nothing specific was found, or when the user asks for text only.
+
+                    Calls and meetings have their own record. ReMynd transcribes call audio on the \
+                    Mac, so for anything said out loud — what someone said, what was agreed, a \
+                    meeting recap, a quote — use list_calls, search_calls and call_transcript. The \
+                    screen tools cannot hear: never conclude that a conversation was not captured \
+                    from screen history alone.
                     """
                 ]]
 
