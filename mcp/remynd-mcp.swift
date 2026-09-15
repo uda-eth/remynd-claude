@@ -210,7 +210,20 @@ struct Tool {
     /// `run` returns prose. A moment revealed as pixels is a list of blocks —
     /// caption, image, caption, image — and the image blocks are what a chat
     /// client renders inline. Returns (blocks, isError).
-    var content: (([String: Any]) -> ([[String: Any]], Bool))? = nil
+    var content: (([String: Any]) -> ToolContent)? = nil
+
+    /// Optional: the tool's `_meta`. MCP Apps reads `_meta.ui` from here — the
+    /// view that renders the result, and who may call the tool.
+    var meta: [String: Any]? = nil
+}
+
+/// A result made of content blocks, with optional structuredContent. For MCP
+/// Apps hosts, structuredContent goes to the view and is kept out of the
+/// model's context.
+struct ToolContent {
+    var blocks: [[String: Any]]
+    var isError: Bool
+    var structured: [String: Any]? = nil
 }
 
 /// Reads a string argument, accepting common aliases.
@@ -434,13 +447,15 @@ func parseLocalMoment(_ raw: String) -> Date? {
 /// Build the content blocks for one moment. Pure orchestration: extractor →
 /// JPEG → blocks. Every failure is a text block that says what happened, so the
 /// model can react (widen the window, drop the app filter) instead of guessing.
-func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
+func showOneMoment(_ a: [String: Any], label: String? = nil, withTrailer: Bool = true) -> MomentResult {
     // A bad argument or a missing extractor is an error the model should react
     // to; "nothing recorded there" is a clean answer, not an error.
-    func fail(_ msg: String, isError: Bool = true) -> ([[String: Any]], Bool) { ([["type": "text", "text": msg]], isError) }
+    func fail(_ msg: String, isError: Bool = true) -> MomentResult {
+        MomentResult(blocks: [["type": "text", "text": msg]], isError: isError)
+    }
 
     guard let atRaw = str(a, "at", aliases: ["time", "timestamp", "when", "moment", "id"]) else {
-        return fail("Provide `at` as a local time, \"YYYY-MM-DD HH:MM:SS\" — take it from a search_screen_history or reconstruct_day result.")
+        return fail("Provide `at` as a local time, \"YYYY-MM-DD HH:MM:SS\" (or up to three `moments`) — take it from a search_screen_history, reconstruct_day or screen_text_in_range result.")
     }
     guard let at = parseLocalMoment(atRaw) else {
         return fail("Could not read `at` = \"\(atRaw)\". Use local time as \"YYYY-MM-DD HH:MM:SS\".")
@@ -456,7 +471,7 @@ func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
     let count = max(1, min(FRAME_MAX_COUNT, int(a, "max_frames") ?? 2))
     let app = str(a, "app", aliases: ["application"])
 
-    let outDir = NSTemporaryDirectory() + "remynd-mcp-frames-\(ProcessInfo.processInfo.processIdentifier)-\(Int(Date().timeIntervalSince1970))"
+    let outDir = NSTemporaryDirectory() + "remynd-mcp-frames-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
     defer { try? FileManager.default.removeItem(atPath: outDir) }
 
     let from = momentSecondsIn.string(from: at.addingTimeInterval(-Double(halfWindow)))
@@ -471,8 +486,8 @@ func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         return fail("The frame extractor did not return a manifest for \(from) – \(to). " + String(r.out.prefix(300)))
     }
-    let frames = (obj["frames"] as? [[String: Any]]) ?? []
-    if frames.isEmpty {
+    let found = (obj["frames"] as? [[String: Any]]) ?? []
+    if found.isEmpty {
         var why = "No recorded frames within ±\(halfWindow)s of \(momentSecondsIn.string(from: at))"
         if let app = app, !app.isEmpty { why += " while \(app) was frontmost" }
         if let note = obj["note"] as? String, !note.isEmpty { why += " (\(note))" }
@@ -483,11 +498,10 @@ func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
 
     // One caption per frame, then the frame. The caption carries what the
     // model needs to talk about the picture — app, window, exact second —
-    // without OCR, which is the point of showing it.
-    var blocks: [[String: Any]] = []
-    var shown = 0
-    var totalBytes = 0
-    for f in frames {
+    // without OCR, which is the point of showing it. Each frame also gets a
+    // record for the MCP Apps viewer, which draws it large in the chat.
+    var out = MomentResult(blocks: [], isError: false)
+    for f in found {
         guard let path = f["path"] as? String,
               let jpg = jpegBase64(pngPath: path, maxEdge: FRAME_MAX_EDGE, quality: FRAME_JPEG_QUALITY) else { continue }
         let when = (f["time"] as? String).flatMap { momentSecondsIn.date(from: $0) }.map { momentCaptionOut.string(from: $0) }
@@ -502,19 +516,416 @@ func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
             }
         }
         let what = window.isEmpty ? appName : (appName.isEmpty ? window : "\(appName) — \(window)")
-        blocks.append(["type": "text", "text": "\(what.isEmpty ? "Screen" : what) · \(when)"])
-        blocks.append(["type": "image", "data": jpg.data, "mimeType": "image/jpeg"])
-        shown += 1
-        totalBytes += jpg.bytes
+        let head = "\(what.isEmpty ? "Screen" : what) · \(when)"
+        out.blocks.append(["type": "text", "text": label.map { "\($0) — \(head)" } ?? head])
+        out.blocks.append(["type": "image", "data": jpg.data, "mimeType": "image/jpeg"])
+
+        let epoch = (f["epoch"] as? Double) ?? at.timeIntervalSince1970
+        let id = String(Int64((epoch * 1000).rounded()))
+        cacheFrame(id, (jpg.data, jpg.width, jpg.height))
+        var record: [String: Any] = ["id": id, "what": what.isEmpty ? "Screen" : what, "when": when,
+                                     "width": jpg.width, "height": jpg.height]
+        if let label = label { record["label"] = label }
+        if let t = f["time"] as? String { record["time"] = t }
+        out.frames.append(record)
     }
-    guard shown > 0 else {
+    guard !out.frames.isEmpty else {
         return fail("Frames were found for \(from) – \(to) but none could be decoded. Try again, or check that ReMynd's recording is readable.")
     }
-    let trailer = "\(shown) frame\(shown == 1 ? "" : "s") from the user's own screen recording, \(from) – \(to) local. "
-        + "These are the real pixels that were on screen; describe what is visible and point the user at it."
-    blocks.append(["type": "text", "text": trailer])
-    return (blocks, false)
+    if withTrailer {
+        let n = out.frames.count
+        out.blocks.append(["type": "text", "text":
+            "\(n) frame\(n == 1 ? "" : "s") from the user's own screen recording, \(from) – \(to) local. "
+            + "These are the real pixels that were on screen; describe what is visible and point the user at it."])
+    }
+    return out
 }
+
+/// show_moment entry point: one `at`, or up to three `moments` in a single call.
+///
+/// A recap usually rests on two or three moments. Asking for them one call at a
+/// time is friction a model tends to skip, so one call can carry all of them,
+/// each with a short label that becomes its caption.
+func showMomentContent(_ a: [String: Any]) -> MomentResult {
+    guard let list = a["moments"] as? [Any], !list.isEmpty else { return showOneMoment(a) }
+    let items = Array(list.prefix(3))
+    var out = MomentResult(blocks: [], isError: false)
+    var errors = 0
+    for (i, raw) in items.enumerated() {
+        var m: [String: Any] = [:]
+        if let d = raw as? [String: Any] { m = d } else if let t = raw as? String { m = ["at": t] }
+        for k in ["app", "window_seconds"] where m[k] == nil { if let v = a[k] { m[k] = v } }
+        m["max_frames"] = min(max(1, int(m, "max_frames") ?? int(a, "max_frames") ?? 1), 2)
+        let label = (m["label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let r = showOneMoment(m, label: label, withTrailer: false)
+        if r.isError { errors += 1 }
+        if !r.frames.isEmpty {
+            out.blocks += r.blocks
+            out.frames += r.frames
+        } else {
+            let why = (r.blocks.first?["text"] as? String) ?? "No frames."
+            out.blocks.append(["type": "text", "text": "Moment \(i + 1)\(label.map { " (\($0))" } ?? ""): \(why)"])
+        }
+    }
+    if !out.frames.isEmpty {
+        out.blocks.append(["type": "text", "text":
+            "Frames from the user's own screen recording, \(items.count) moment\(items.count == 1 ? "" : "s"). "
+            + "These are the real pixels that were on screen; describe what is visible and tie each frame to the part of your answer it shows."])
+    }
+    out.isError = out.frames.isEmpty && errors == items.count
+    return out
+}
+
+/// show_moment as a tool result: the blocks for the model, and for an MCP Apps
+/// view a `frames` list naming each image block in order.
+func showMomentToolContent(_ a: [String: Any]) -> ToolContent {
+    let r = showMomentContent(a)
+    var frames = r.frames
+    for i in frames.indices { frames[i]["index"] = i }
+    return ToolContent(blocks: r.blocks, isError: r.isError, structured: frames.isEmpty ? nil : ["frames": frames])
+}
+
+/// moment_frame — app-only. The viewer draws frames straight from the tool
+/// result; this exists for a host that hands the view a result without the
+/// image data, and for a conversation reopened after the server restarted.
+func momentFrameContent(_ a: [String: Any]) -> ToolContent {
+    guard let id = str(a, "id") else {
+        return ToolContent(blocks: [["type": "text", "text": "Provide `id`."]], isError: true)
+    }
+    if let c = cachedFrame(id) {
+        return ToolContent(blocks: [["type": "image", "data": c.data, "mimeType": "image/jpeg"]], isError: false,
+                           structured: ["id": id, "width": c.width, "height": c.height])
+    }
+    guard let ms = Double(id), ms > 0 else {
+        return ToolContent(blocks: [["type": "text", "text": "Unknown frame id."]], isError: true)
+    }
+    let when = momentSecondsIn.string(from: Date(timeIntervalSince1970: ms / 1000))
+    let r = showOneMoment(["at": when, "window_seconds": 5, "max_frames": 1], withTrailer: false)
+    if let img = r.blocks.first(where: { ($0["type"] as? String) == "image" }) {
+        return ToolContent(blocks: [img], isError: false, structured: ["id": id])
+    }
+    return ToolContent(blocks: [["type": "text", "text": "That frame is no longer available."]], isError: true)
+}
+
+/// A next step appended to text results.
+///
+/// Models follow a concrete next step inside a tool result far more reliably
+/// than a general instruction. Without it, a recap ended with "if you want, I
+/// can pull the actual frames" instead of showing them. The example timestamp
+/// is taken from the result itself, so it is a real, local, recorded moment.
+func showMomentHint(tool: String, args: [String: Any], output: String) -> String? {
+    func first(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
+        let idx = m.numberOfRanges > 1 ? 1 : 0
+        guard let r = Range(m.range(at: idx), in: text) else { return nil }
+        return String(text[r])
+    }
+    let date = "\\d{4}-\\d{2}-\\d{2}"
+    var example: String? = nil
+    switch tool {
+    case "search_screen_history":
+        example = first("(\(date) \\d{2}:\\d{2}:\\d{2})", in: output)
+    case "screen_text_in_range":
+        if let d = str(args, "from", aliases: ["start", "begin", "since"]).flatMap({ first("^(\(date))", in: $0) }),
+           let t = first("^(\\d{2}:\\d{2}:\\d{2})", in: output) { example = "\(d) \(t)" }
+    case "reconstruct_day":
+        if let d = str(args, "date", aliases: ["day", "start", "from"]).flatMap({ first("^(\(date))", in: $0) }),
+           let t = first("(\\d{2}:\\d{2})–", in: output) { example = "\(d) \(t):00" }
+    case "recent_activity":
+        break
+    default:
+        return nil
+    }
+    var hint = "Next step: if your answer describes particular moments from this — a call, a meeting, a screen, "
+        + "something the user saw or did — show the one to three that matter with show_moment in this same turn: "
+        + "pass each moment's local time as `at`, or several at once as `moments` with a short `label` each"
+    if let e = example { hint += " (for example at: \"\(e)\")" }
+    hint += ". Show the frames alongside your answer rather than offering to pull them."
+    return hint
+}
+
+// ---------------------------------------------------------------------------
+// Moments, large and inline (MCP Apps)
+//
+// In Claude Desktop, image blocks in a tool result render inside the collapsed
+// tool row as a thumbnail about 50px wide. MCP Apps (io.modelcontextprotocol/ui)
+// is the supported way to put rich content in the conversation itself: the tool
+// names a ui:// HTML resource in `_meta.ui.resourceUri`, the host renders it in
+// a sandboxed iframe, and sends it the tool result over postMessage. The viewer
+// (mcp/moment-viewer.html, embedded below) lays the frames out at the full
+// width of the chat column.
+//
+// The image blocks stay in the result: the model needs to see the frames, and
+// the viewer draws from those same blocks, so nothing is sent twice.
+// structuredContent only names each frame. Hosts without MCP Apps ignore all of
+// this and keep showing the tool row.
+// ---------------------------------------------------------------------------
+
+struct MomentResult {
+    var blocks: [[String: Any]]
+    var isError: Bool
+    var frames: [[String: Any]] = []     // one record per image block, in order
+}
+
+let VIEWER_URI = "ui://remynd/moment-viewer.html"
+let VIEWER_MIME = "text/html;profile=mcp-app"
+
+/// Set from the client's initialize: did it advertise MCP Apps support?
+var clientSupportsUI = false
+
+var frameCache: [String: (data: String, width: Int, height: Int)] = [:]
+var frameCacheOrder: [String] = []
+let frameCacheLock = NSLock()
+func cacheFrame(_ id: String, _ v: (data: String, width: Int, height: Int)) {
+    frameCacheLock.lock(); defer { frameCacheLock.unlock() }
+    if frameCache[id] == nil { frameCacheOrder.append(id) }
+    frameCache[id] = v
+    while frameCacheOrder.count > 24 { frameCache.removeValue(forKey: frameCacheOrder.removeFirst()) }
+}
+func cachedFrame(_ id: String) -> (data: String, width: Int, height: Int)? {
+    frameCacheLock.lock(); defer { frameCacheLock.unlock() }
+    return frameCache[id]
+}
+
+/// A small, content-free event log (~/.remynd-sync/state/mcp-events.log): which
+/// client connected and what it advertised, which tools and resources it asked
+/// for. Claude Desktop's own log hides initialize params, and this is how a
+/// viewer that "doesn't show up" gets diagnosed without touching the screen.
+let EVENTS_LOG = NSHomeDirectory() + "/.remynd-sync/state/mcp-events.log"
+func logClientEvent(_ line: String) {
+    let text = "\(ISO8601DateFormatter().string(from: Date())) pid=\(ProcessInfo.processInfo.processIdentifier) \(line)\n"
+    let fm = FileManager.default
+    try? fm.createDirectory(atPath: (EVENTS_LOG as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    if let size = (try? fm.attributesOfItem(atPath: EVENTS_LOG))?[.size] as? Int, size > 256_000 {
+        try? fm.removeItem(atPath: EVENTS_LOG)
+    }
+    if let h = FileHandle(forWritingAtPath: EVENTS_LOG) {
+        h.seekToEndOfFile(); h.write(Data(text.utf8)); try? h.close()
+    } else {
+        try? text.write(toFile: EVENTS_LOG, atomically: true, encoding: .utf8)
+    }
+}
+
+let MOMENT_VIEWER_HTML = #"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ReMynd moments</title>
+<style>
+  :root {
+    --fg: var(--color-text-primary, #1f1e1d);
+    --muted: var(--color-text-secondary, #6b6a68);
+    --line: var(--color-border-primary, rgba(31, 30, 29, 0.14));
+    --skeleton: rgba(127, 127, 127, 0.12);
+    --font: var(--font-sans, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fg: var(--color-text-primary, #ecebe8);
+      --muted: var(--color-text-secondary, #a6a39e);
+      --line: var(--color-border-primary, rgba(236, 235, 232, 0.16));
+    }
+  }
+  :root[data-theme="dark"] {
+    --fg: var(--color-text-primary, #ecebe8);
+    --muted: var(--color-text-secondary, #a6a39e);
+    --line: var(--color-border-primary, rgba(236, 235, 232, 0.16));
+  }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--fg); font-family: var(--font); }
+  main { display: flex; flex-direction: column; gap: 20px; padding: 2px 0 4px; }
+  figure { margin: 0; min-width: 0; }
+  figcaption {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
+    margin: 0 0 8px; font-size: 13px; line-height: 1.4;
+  }
+  .label { font-weight: 600; }
+  .meta { color: var(--muted); overflow-wrap: anywhere; }
+  .shot {
+    display: block; width: 100%; margin: 0; padding: 0; font: inherit; appearance: none;
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0b0b0b; cursor: default;
+  }
+  .can-zoom .shot { cursor: zoom-in; }
+  .fullscreen .shot { cursor: zoom-out; }
+  .shot img { display: block; width: 100%; height: auto; }
+  .skeleton {
+    width: 100%; aspect-ratio: 16 / 7; border-radius: 12px; border: 1px solid var(--line);
+    background: linear-gradient(90deg, var(--skeleton), rgba(127, 127, 127, 0.22), var(--skeleton));
+    background-size: 200% 100%; animation: sheen 1.4s ease-in-out infinite;
+  }
+  @keyframes sheen { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } }
+  .status { font-size: 13px; color: var(--muted); padding: 6px 0; }
+  .fullscreen main { padding: 16px; }
+</style>
+</head>
+<body>
+<main id="root"><div class="status">Pulling frames from your ReMynd recording…</div></main>
+<script>
+(function () {
+  "use strict";
+  var root = document.getElementById("root");
+  var nextId = 1;
+  var pending = {};
+  var hostContext = {};
+  var displayMode = "inline";
+
+  function post(msg) { msg.jsonrpc = "2.0"; window.parent.postMessage(msg, "*"); }
+  function request(method, params) {
+    var id = nextId++;
+    post({ id: id, method: method, params: params || {} });
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      setTimeout(function () {
+        if (pending[id]) { delete pending[id]; reject(new Error("timeout: " + method)); }
+      }, 30000);
+    });
+  }
+  function notify(method, params) { post({ method: method, params: params || {} }); }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    var m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && m.method === undefined) {
+      var p = pending[m.id];
+      if (!p) return;
+      delete pending[m.id];
+      if (m.error) p.reject(new Error(m.error.message || "error")); else p.resolve(m.result);
+      return;
+    }
+    if (m.id !== undefined && m.method) {
+      if (m.method === "ui/resource-teardown" || m.method === "ping") post({ id: m.id, result: {} });
+      else post({ id: m.id, error: { code: -32601, message: "Method not found: " + m.method } });
+      return;
+    }
+    switch (m.method) {
+      case "ui/notifications/tool-input": onInput((m.params && m.params.arguments) || {}); break;
+      case "ui/notifications/tool-result": onResult(m.params || {}); break;
+      case "ui/notifications/tool-cancelled": setStatus("Cancelled."); break;
+      case "ui/notifications/host-context-changed": applyContext(m.params || {}); break;
+    }
+  });
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function setStatus(text) { root.replaceChildren(el("div", "status", text)); reportSize(); }
+
+  function applyContext(ctx) {
+    for (var k in ctx) hostContext[k] = ctx[k];
+    var vars = hostContext.styles && hostContext.styles.variables;
+    if (vars) for (var v in vars) if (vars[v]) document.documentElement.style.setProperty(v, vars[v]);
+    if (hostContext.theme) document.documentElement.setAttribute("data-theme", hostContext.theme);
+    var modes = hostContext.availableDisplayModes || [];
+    document.body.classList.toggle("can-zoom", modes.indexOf("fullscreen") >= 0);
+    if (hostContext.displayMode) {
+      displayMode = hostContext.displayMode;
+      document.body.classList.toggle("fullscreen", displayMode === "fullscreen");
+    }
+    reportSize();
+  }
+
+  // While the frames are being pulled: one placeholder per requested moment.
+  function onInput(args) {
+    if (root.querySelector("img")) return;
+    var moments = Array.isArray(args.moments) ? args.moments.slice(0, 3) : [args];
+    var frag = document.createDocumentFragment();
+    moments.forEach(function (m) {
+      var fig = el("figure");
+      var cap = el("figcaption");
+      cap.append(el("span", "label", (m && m.label) || "Finding the moment…"));
+      fig.append(cap, el("div", "skeleton"));
+      frag.append(fig);
+    });
+    root.replaceChildren(frag);
+    reportSize();
+  }
+
+  // The frames arrive inside the tool result: caption text, then the image.
+  // structuredContent.frames names each image block in order. If a host hands
+  // over a result without the image data, the frame is fetched by id through
+  // the app-only moment_frame tool.
+  function onResult(result) {
+    var sc = result.structuredContent || {};
+    var frames = Array.isArray(sc.frames) ? sc.frames : [];
+    var images = (result.content || []).filter(function (b) { return b && b.type === "image" && b.data; });
+    if (!frames.length && !images.length) {
+      var t = (result.content || []).filter(function (b) { return b && b.type === "text"; })[0];
+      setStatus(t ? t.text : "No frames for that moment.");
+      return;
+    }
+    var list = frames.length ? frames : images.map(function (_, i) { return { index: i }; });
+    var frag = document.createDocumentFragment();
+    list.forEach(function (f, i) {
+      var fig = el("figure");
+      var cap = el("figcaption");
+      if (f.label) cap.append(el("span", "label", f.label));
+      var meta = [f.what, f.when].filter(Boolean).join(" · ");
+      if (meta) cap.append(el("span", "meta", meta));
+      var btn = el("button", "shot");
+      btn.type = "button";
+      var img = document.createElement("img");
+      img.alt = f.label || f.what || "Screen frame";
+      if (f.width && f.height) { img.width = f.width; img.height = f.height; }
+      img.addEventListener("load", reportSize);
+      var block = images[f.index != null ? f.index : i];
+      if (block) img.src = "data:" + (block.mimeType || "image/jpeg") + ";base64," + block.data;
+      else if (f.id) fetchFrame(f.id, img);
+      btn.append(img);
+      btn.addEventListener("click", toggleFullscreen);
+      fig.append(cap, btn);
+      frag.append(fig);
+    });
+    root.replaceChildren(frag);
+    reportSize();
+  }
+
+  function fetchFrame(id, img) {
+    request("tools/call", { name: "moment_frame", arguments: { id: id } }).then(function (r) {
+      var b = ((r && r.content) || []).filter(function (x) { return x.type === "image" && x.data; })[0];
+      if (b) img.src = "data:" + (b.mimeType || "image/jpeg") + ";base64," + b.data;
+      else img.alt = "Frame unavailable";
+    }).catch(function () { img.alt = "Frame unavailable"; });
+  }
+
+  function toggleFullscreen() {
+    var modes = hostContext.availableDisplayModes || [];
+    if (modes.indexOf("fullscreen") < 0) return;
+    var want = displayMode === "fullscreen" ? "inline" : "fullscreen";
+    request("ui/request-display-mode", { mode: want }).then(function (r) {
+      applyContext({ displayMode: (r && r.mode) || want });
+    }).catch(function () {});
+  }
+
+  var lastHeight = 0;
+  function reportSize() {
+    var h = Math.ceil(document.documentElement.getBoundingClientRect().height);
+    if (h > 0 && h !== lastHeight) { lastHeight = h; notify("ui/notifications/size-changed", { height: h }); }
+  }
+  if (window.ResizeObserver) new ResizeObserver(reportSize).observe(document.documentElement);
+
+  request("ui/initialize", {
+    appInfo: { name: "ReMynd moments", version: "1.0.0" },
+    appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+    protocolVersion: "2026-01-26"
+  }).then(function (res) {
+    applyContext((res && res.hostContext) || {});
+    notify("ui/notifications/initialized", {});
+  }).catch(function () {
+    notify("ui/notifications/initialized", {});
+  });
+})();
+</script>
+</body>
+</html>
+"""#
 
 let tools: [Tool] = [
 
@@ -554,7 +965,9 @@ let tools: [Tool] = [
          day. The date is the user's LOCAL date. Each activity comes with a time span — use it: to \
          say what actually happened inside an activity rather than just how long it lasted, call \
          screen_text_in_range over that span and read it. A day with no recording says so plainly; \
-         that means the Mac was off, asleep or not recording, not that the user did nothing.
+         that means the Mac was off, asleep or not recording, not that the user did nothing. When your \
+         answer describes particular moments from the day, show the headline ones with show_moment in \
+         the same turn.
          """,
          schema: ["type": "object",
                   "properties": ["date": ["type": "string", "description": "Local date, YYYY-MM-DD."]],
@@ -597,7 +1010,8 @@ let tools: [Tool] = [
          The text is OCR, so it arrives as fragments with interface chrome mixed in and occasional \
          garbled words. Read across it and report what it means; do not quote it raw at the user. \
          Digits are the weak point — treat numbers read off the screen as leads, not facts. Where a \
-         name or subject is too mangled to be sure of, leave it out rather than guess.
+         name or subject is too mangled to be sure of, leave it out rather than guess. When what you \
+         read here is the moment your answer is about, show it with show_moment in the same turn.
          """,
          schema: ["type": "object",
                   "properties": [
@@ -692,11 +1106,14 @@ let tools: [Tool] = [
          were on their screen at that second, returned as images you and the user both see. Text \
          tells them what was there; this shows them.
 
-         Use it once you have located the moment with search_screen_history, reconstruct_day or \
-         screen_text_in_range: pass that result's local timestamp as `at`. Reach for it whenever the \
-         answer IS a specific thing they saw — a page, a message, a design, a chart, an error dialog, \
-         a photo, a slide — or when the OCR is too garbled to answer from. Don't scatter frames across \
-         a broad summary; reveal the one or two moments that answer the question.
+         Call it on your own, in the same turn, whenever your answer rests on particular moments: the \
+         most important thing they did, a call or meeting, something they saw or read, a message, a \
+         design, a decision, an error, or screen text too garbled to trust. A recap of a day or a week \
+         still gets frames of its one to three headline moments. Locate each moment with \
+         search_screen_history, reconstruct_day or screen_text_in_range, then pass its local timestamp \
+         as `at` — or pass up to three at once as `moments`, each with a short `label` saying what it \
+         shows. Don't ask first and don't offer frames at the end of your answer; show them. Skip it \
+         only for pure numbers (time per app, counts) or when nothing specific was found.
 
          Frames come from a ±window around `at` (default 30 seconds, 2 frames). Pass `app` to keep to \
          the application in question when several were on screen. Nothing is written to the user's \
@@ -710,11 +1127,29 @@ let tools: [Tool] = [
                      "at": ["type": "string", "description": "Local time of the moment, \"YYYY-MM-DD HH:MM:SS\" (a bare HH:MM is accepted). Take it from a search or day result."],
                      "app": ["type": "string", "description": "Optional. Only frames while this app was frontmost (substring match, e.g. \"Chrome\", \"Slack\")."],
                      "window_seconds": ["type": "integer", "description": "Optional. Seconds either side of `at` to look in. Default 30, max 600."],
-                     "max_frames": ["type": "integer", "description": "Optional. How many frames to return, 1–4. Default 2."]
-                  ],
-                  "required": ["at"]],
+                     "max_frames": ["type": "integer", "description": "Optional. How many frames to return, 1–4. Default 2 for `at`, 1 per moment for `moments`."],
+                     "moments": ["type": "array", "maxItems": 3,
+                                 "description": "Optional. Up to three moments to show in one call, instead of `at`.",
+                                 "items": ["type": "object",
+                                           "properties": [
+                                              "at": ["type": "string", "description": "Local time, \"YYYY-MM-DD HH:MM:SS\"."],
+                                              "label": ["type": "string", "description": "Short caption, e.g. \"Boris demoing Storage settings to Julian\"."],
+                                              "app": ["type": "string", "description": "Optional app filter for this moment."]
+                                           ],
+                                           "required": ["at"]]]
+                  ]],
          run: { _ in ("show_moment returns image content; this client did not request it.", false) },
-         content: showMomentContent),
+         content: showMomentToolContent,
+         meta: ["ui": ["resourceUri": VIEWER_URI]]),
+
+    Tool(name: "moment_frame",
+         description: "Used by ReMynd's moment viewer to reload a frame it is displaying. Not for answering questions: use show_moment.",
+         schema: ["type": "object",
+                  "properties": ["id": ["type": "string", "description": "A frame id from a show_moment result."]],
+                  "required": ["id"]],
+         run: { _ in ("moment_frame returns image content.", false) },
+         content: momentFrameContent,
+         meta: ["ui": ["resourceUri": VIEWER_URI, "visibility": ["app"]]]),
 
     Tool(name: "sync_status",
          description: """
@@ -733,7 +1168,7 @@ let tools: [Tool] = [
 // ---------------------------------------------------------------------------
 
 let SERVER_NAME = "remynd"
-let SERVER_VERSION = "1.1.0"
+let SERVER_VERSION = "1.3.0"
 let SUPPORTED_PROTOCOLS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 let DEFAULT_PROTOCOL = "2025-06-18"
 
@@ -750,7 +1185,15 @@ func errorResponse(_ id: Any?, _ code: Int, _ message: String) -> [String: Any] 
 }
 
 func toolListPayload() -> [[String: Any]] {
-    tools.map { ["name": $0.name, "description": $0.description, "inputSchema": $0.schema] }
+    tools.compactMap { t in
+        let visibility = ((t.meta?["ui"] as? [String: Any])?["visibility"] as? [String]) ?? ["model", "app"]
+        // An MCP Apps host hides app-only tools from its model itself. A client
+        // without MCP Apps would hand them straight to the model, so don't list them.
+        if !visibility.contains("model") && !clientSupportsUI { return nil }
+        var d: [String: Any] = ["name": t.name, "description": t.description, "inputSchema": t.schema]
+        if let m = t.meta { d["_meta"] = m }
+        return d
+    }
 }
 
 /// Handles one JSON-RPC message. Returns nil for notifications, which take no
@@ -765,6 +1208,11 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
     switch method {
 
     case "initialize":
+        let clientCaps = params["capabilities"] as? [String: Any] ?? [:]
+        let extensions = clientCaps["extensions"] as? [String: Any] ?? [:]
+        clientSupportsUI = extensions["io.modelcontextprotocol/ui"] != nil
+        let clientInfo = params["clientInfo"] as? [String: Any] ?? [:]
+        logClientEvent("initialize client=\(clientInfo["name"] ?? "?")/\(clientInfo["version"] ?? "?") protocol=\(params["protocolVersion"] ?? "?") ui=\(clientSupportsUI) extensions=\(extensions.keys.sorted()) capabilities=\(clientCaps.keys.sorted())")
         // Echo the client's protocol version when we support it, so older and
         // newer clients both get a version they can speak.
         let asked = params["protocolVersion"] as? String
@@ -772,7 +1220,7 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
         return ["jsonrpc": "2.0", "id": id ?? NSNull(),
                 "result": [
                     "protocolVersion": version,
-                    "capabilities": ["tools": ["listChanged": false]],
+                    "capabilities": ["tools": ["listChanged": false], "resources": ["listChanged": false]],
                     "serverInfo": ["name": SERVER_NAME, "version": SERVER_VERSION],
                     "instructions": """
                     ReMynd is the user's own screen history — everything they have seen, read and \
@@ -780,10 +1228,14 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
                     the user's own past rather than general knowledge. Prefer looking it up over \
                     asking them: they already told their computer, and this is how you read it back.
 
-                    When the answer is a specific moment — something they saw, a screen, a message, \
-                    a design, an error — find its timestamp, then reveal it with show_moment so they \
-                    see the actual frame rather than a description of it. One or two moments per \
-                    question; broad summaries stay as text.
+                    Show the moments, don't only describe them. Whenever your answer rests on \
+                    particular moments — the most important thing they did, a call or meeting, \
+                    something they saw or read, a message, a design, a decision, an error — call \
+                    show_moment for the one to three moments that matter most, in the same turn, and \
+                    refer to what the frames show. A recap of a day or week still gets frames of its \
+                    headline moments. Do this without asking, and never end an answer by offering to \
+                    pull frames. Skip frames only for pure numbers (time per app, counts), when \
+                    nothing specific was found, or when the user asks for text only.
                     """
                 ]]
 
@@ -797,7 +1249,19 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
         return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": ["tools": toolListPayload()]]
 
     case "resources/list":
-        return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": ["resources": []]]
+        return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": ["resources": [[
+            "uri": VIEWER_URI, "name": "ReMynd moment viewer", "mimeType": VIEWER_MIME,
+            "description": "Shows frames from the user's screen recording large, inline in the conversation."
+        ]]]]
+
+    case "resources/read":
+        let uri = params["uri"] as? String ?? ""
+        logClientEvent("resources/read \(uri)")
+        guard uri == VIEWER_URI else { return errorResponse(id, -32002, "Resource not found: \(uri)") }
+        return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": ["contents": [[
+            "uri": VIEWER_URI, "mimeType": VIEWER_MIME, "text": MOMENT_VIEWER_HTML,
+            "_meta": ["ui": ["prefersBorder": false]]
+        ]]]]
 
     case "prompts/list":
         return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": ["prompts": []]]
@@ -822,9 +1286,12 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
 
         // Tools that answer with pixels return their own content blocks.
         if let build = tool.content {
-            let (blocks, isError) = build(args)
-            return ["jsonrpc": "2.0", "id": id ?? NSNull(),
-                    "result": ["content": blocks, "isError": isError]]
+            let r = build(args)
+            var result: [String: Any] = ["content": r.blocks, "isError": r.isError]
+            if let structured = r.structured { result["structuredContent"] = structured }
+            let images = r.blocks.filter { ($0["type"] as? String) == "image" }.count
+            logClientEvent("tools/call \(tool.name) images=\(images) isError=\(r.isError)")
+            return ["jsonrpc": "2.0", "id": id ?? NSNull(), "result": result]
         }
 
         let (raw, ok) = tool.run(args)
@@ -835,8 +1302,12 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
         // A failed retrieval is reported as an error *result*, not a protocol
         // error: the model should see what went wrong and be able to adjust,
         // rather than the client treating it as a transport fault.
+        var content: [[String: Any]] = [["type": "text", "text": text]]
+        if ok, let hint = showMomentHint(tool: tool.name, args: args, output: text) {
+            content.append(["type": "text", "text": hint])
+        }
         return ["jsonrpc": "2.0", "id": id ?? NSNull(),
-                "result": ["content": [["type": "text", "text": text]],
+                "result": ["content": content,
                            "isError": !ok]]
 
     default:

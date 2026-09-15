@@ -50,6 +50,12 @@ recording and returns them as an image, captioned with the app, window and exact
 recordings are encrypted, so the ReMynd app has to be running for those; nothing is copied out of
 your history and nothing is stored. Frames are the raw screen — unlike text, they are not redacted.
 
+In Claude Desktop the frames appear large, inline in the conversation: `show_moment` ships an
+[MCP Apps](https://modelcontextprotocol.io/extensions/apps) view (`mcp/moment-viewer.html`) that lays
+each frame out at the width of the chat, captioned, with click-to-enlarge. Clients without MCP Apps
+still get the frames as ordinary image results. `tests/viewer-harness.cjs` renders the view in real
+Chrome the way a host does (`NODE_PATH=<dir with playwright> node tests/viewer-harness.cjs <out> mcp/remynd-mcp`).
+
 **Same-machine clients** — Claude Desktop, Cursor, VS Code, Gemini CLI — are wired up by the
 installer. Restart the app and ask it what you did yesterday.
 

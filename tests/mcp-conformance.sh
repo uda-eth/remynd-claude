@@ -310,5 +310,114 @@ else
   ok "remynd-vision not installed here — show_moment image path not exercised"
 fi
 
+# ---------------------------------------------------------------------------
+hd "Frames are offered as the next step, and several moments fit in one call"
+# A recap used to end with "if you want, I can pull the frames". Text results now
+# carry a concrete show_moment next step with a real timestamp from the result.
+DAY="$(/bin/date -v-1d '+%Y-%m-%d')"
+R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"reconstruct_day\",\"arguments\":{\"date\":\"$DAY\"}}}")"
+HINT="$(printf '%s' "$R" | /usr/bin/python3 -c 'import json,sys
+try:
+    c=json.load(sys.stdin)["result"]["content"]
+    print(c[-1]["text"] if len(c)>1 else "NONE")
+except Exception as e: print("ERR")')"
+case "$HINT" in
+  *show_moment*) ok "reconstruct_day result ends with a show_moment next step" ;;
+  *) bad "reconstruct_day result has no show_moment next step: $HINT" ;;
+esac
+
+if [ -x "$HOME/.remynd-sync/bin/remynd-vision" ]; then
+  A1="$(/bin/date -v-2M '+%Y-%m-%d %H:%M:%S')"; A2="$(/bin/date -v-6M '+%Y-%m-%d %H:%M:%S')"
+  R="$(drive "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"show_moment\",\"arguments\":{\"window_seconds\":240,\"moments\":[{\"at\":\"$A1\",\"label\":\"first moment\"},{\"at\":\"$A2\",\"label\":\"second moment\"}]}}}")"
+  SHAPE="$(printf '%s' "$R" | /usr/bin/python3 -c 'import json,sys
+try:
+    r=json.load(sys.stdin)["result"]; c=r["content"]
+    imgs=sum(1 for b in c if b["type"]=="image")
+    labels=sum(1 for b in c if b["type"]=="text" and ("first moment" in b["text"] or "second moment" in b["text"]))
+    print("%d %d %s" % (imgs, labels, r["isError"]))
+except Exception as e: print("ERR "+str(e))')"
+  case "$SHAPE" in
+    "0 "*) ok "moments: recorder idle, explained per moment ($SHAPE)" ;;
+    [12]" 2 False") ok "moments: two labelled moments in one call ($SHAPE images/labels/isError)" ;;
+    *) bad "moments returned an unexpected shape: $SHAPE" ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+hd "Moments render large and inline: the MCP Apps viewer"
+# In Claude Desktop, image blocks in a tool result sit in the collapsed tool row
+# as a ~50px thumbnail. show_moment links an MCP Apps view that lays the same
+# frames out at the width of the chat.
+INIT_UI='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}},"clientInfo":{"name":"conformance","version":"1"}}}'
+INIT_PLAIN='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"conformance","version":"1"}}}'
+OUT_UI="$(drive "$INIT_UI" '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' '{"jsonrpc":"2.0","id":2,"method":"resources/list"}' '{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"ui://remynd/moment-viewer.html"}}')"
+OUT_PLAIN="$(drive "$INIT_PLAIN" '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')"
+VIEWER="$(OUT_UI="$OUT_UI" OUT_PLAIN="$OUT_PLAIN" /usr/bin/python3 -c '
+import json, os
+def by_id(text):
+    d = {}
+    for line in text.splitlines():
+        try:
+            o = json.loads(line); d[o.get("id")] = o
+        except Exception:
+            pass
+    return d
+try:
+    ui, plain = by_id(os.environ["OUT_UI"]), by_id(os.environ["OUT_PLAIN"])
+    tools = {t["name"]: t for t in ui[1]["result"]["tools"]}
+    plain_tools = {t["name"] for t in plain[1]["result"]["tools"]}
+    link = tools["show_moment"].get("_meta", {}).get("ui", {}).get("resourceUri") == "ui://remynd/moment-viewer.html"
+    apponly = tools.get("moment_frame", {}).get("_meta", {}).get("ui", {}).get("visibility") == ["app"]
+    hidden = "moment_frame" not in plain_tools
+    listed = any(r["uri"] == "ui://remynd/moment-viewer.html" for r in ui[2]["result"]["resources"])
+    c = ui[3]["result"]["contents"][0]
+    html = c["mimeType"] == "text/html;profile=mcp-app" and "ui/initialize" in c["text"] and "ui/notifications/tool-result" in c["text"]
+    print(" ".join("%s=%s" % kv for kv in [("link", link), ("apponly", apponly), ("hidden", hidden), ("listed", listed), ("html", html)]))
+except Exception as e:
+    print("ERR " + repr(e))
+')"
+for pair in "link:show_moment links the viewer through _meta.ui.resourceUri" \
+            "apponly:moment_frame is app-only (visibility [app]) for MCP Apps clients" \
+            "hidden:moment_frame is not listed to clients without MCP Apps" \
+            "listed:resources/list includes the viewer" \
+            "html:resources/read returns the viewer as text/html;profile=mcp-app"; do
+  key="${pair%%:*}"; label="${pair#*:}"
+  case " $VIEWER " in *" $key=True "*) ok "$label" ;; *) bad "$label ($VIEWER)" ;; esac
+done
+
+if [ -x "$HOME/.remynd-sync/bin/remynd-vision" ]; then
+  AT="$(/bin/date -v-3M '+%Y-%m-%d %H:%M:%S')"
+  ROUND="$(/usr/bin/python3 - "$MCP" "$AT" <<'PY'
+import json, subprocess, sys
+p = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+def call(o):
+    p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+    return json.loads(p.stdout.readline())
+try:
+    call({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"extensions": {"io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]}}}, "clientInfo": {"name": "conformance", "version": "1"}}})
+    r = call({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "show_moment", "arguments": {"at": sys.argv[2], "window_seconds": 300, "max_frames": 1}}})["result"]
+    imgs = [b for b in r["content"] if b["type"] == "image"]
+    if not imgs:
+        print("idle")
+    else:
+        frames = (r.get("structuredContent") or {}).get("frames", [])
+        f = frames[0] if frames else {}
+        named = len(frames) == len(imgs) and f.get("index") == 0 and bool(f.get("id")) and f.get("width", 0) > 0
+        m = call({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "moment_frame", "arguments": {"id": f.get("id", "")}}})["result"]
+        same = any(b["type"] == "image" and b["data"] == imgs[0]["data"] for b in m["content"])
+        print("named=%s same=%s" % (named, same))
+except Exception as e:
+    print("ERR " + repr(e))
+finally:
+    p.kill()
+PY
+)"
+  case "$ROUND" in
+    idle) ok "viewer data: recorder idle in the last 5 min, round trip not exercised" ;;
+    "named=True same=True") ok "show_moment names each frame for the viewer, and moment_frame hands the same frame back" ;;
+    *) bad "viewer round trip unexpected: $ROUND" ;;
+  esac
+fi
+
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

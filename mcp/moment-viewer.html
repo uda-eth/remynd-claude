@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>ReMynd moments</title>
+<style>
+  :root {
+    --fg: var(--color-text-primary, #1f1e1d);
+    --muted: var(--color-text-secondary, #6b6a68);
+    --line: var(--color-border-primary, rgba(31, 30, 29, 0.14));
+    --skeleton: rgba(127, 127, 127, 0.12);
+    --font: var(--font-sans, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fg: var(--color-text-primary, #ecebe8);
+      --muted: var(--color-text-secondary, #a6a39e);
+      --line: var(--color-border-primary, rgba(236, 235, 232, 0.16));
+    }
+  }
+  :root[data-theme="dark"] {
+    --fg: var(--color-text-primary, #ecebe8);
+    --muted: var(--color-text-secondary, #a6a39e);
+    --line: var(--color-border-primary, rgba(236, 235, 232, 0.16));
+  }
+  html, body { margin: 0; padding: 0; background: transparent; color: var(--fg); font-family: var(--font); }
+  main { display: flex; flex-direction: column; gap: 20px; padding: 2px 0 4px; }
+  figure { margin: 0; min-width: 0; }
+  figcaption {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
+    margin: 0 0 8px; font-size: 13px; line-height: 1.4;
+  }
+  .label { font-weight: 600; }
+  .meta { color: var(--muted); overflow-wrap: anywhere; }
+  .shot {
+    display: block; width: 100%; margin: 0; padding: 0; font: inherit; appearance: none;
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0b0b0b; cursor: default;
+  }
+  .can-zoom .shot { cursor: zoom-in; }
+  .fullscreen .shot { cursor: zoom-out; }
+  .shot img { display: block; width: 100%; height: auto; }
+  .skeleton {
+    width: 100%; aspect-ratio: 16 / 7; border-radius: 12px; border: 1px solid var(--line);
+    background: linear-gradient(90deg, var(--skeleton), rgba(127, 127, 127, 0.22), var(--skeleton));
+    background-size: 200% 100%; animation: sheen 1.4s ease-in-out infinite;
+  }
+  @keyframes sheen { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } }
+  .status { font-size: 13px; color: var(--muted); padding: 6px 0; }
+  .fullscreen main { padding: 16px; }
+</style>
+</head>
+<body>
+<main id="root"><div class="status">Pulling frames from your ReMynd recording…</div></main>
+<script>
+(function () {
+  "use strict";
+  var root = document.getElementById("root");
+  var nextId = 1;
+  var pending = {};
+  var hostContext = {};
+  var displayMode = "inline";
+
+  function post(msg) { msg.jsonrpc = "2.0"; window.parent.postMessage(msg, "*"); }
+  function request(method, params) {
+    var id = nextId++;
+    post({ id: id, method: method, params: params || {} });
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      setTimeout(function () {
+        if (pending[id]) { delete pending[id]; reject(new Error("timeout: " + method)); }
+      }, 30000);
+    });
+  }
+  function notify(method, params) { post({ method: method, params: params || {} }); }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    var m = event.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id !== undefined && m.method === undefined) {
+      var p = pending[m.id];
+      if (!p) return;
+      delete pending[m.id];
+      if (m.error) p.reject(new Error(m.error.message || "error")); else p.resolve(m.result);
+      return;
+    }
+    if (m.id !== undefined && m.method) {
+      if (m.method === "ui/resource-teardown" || m.method === "ping") post({ id: m.id, result: {} });
+      else post({ id: m.id, error: { code: -32601, message: "Method not found: " + m.method } });
+      return;
+    }
+    switch (m.method) {
+      case "ui/notifications/tool-input": onInput((m.params && m.params.arguments) || {}); break;
+      case "ui/notifications/tool-result": onResult(m.params || {}); break;
+      case "ui/notifications/tool-cancelled": setStatus("Cancelled."); break;
+      case "ui/notifications/host-context-changed": applyContext(m.params || {}); break;
+    }
+  });
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function setStatus(text) { root.replaceChildren(el("div", "status", text)); reportSize(); }
+
+  function applyContext(ctx) {
+    for (var k in ctx) hostContext[k] = ctx[k];
+    var vars = hostContext.styles && hostContext.styles.variables;
+    if (vars) for (var v in vars) if (vars[v]) document.documentElement.style.setProperty(v, vars[v]);
+    if (hostContext.theme) document.documentElement.setAttribute("data-theme", hostContext.theme);
+    var modes = hostContext.availableDisplayModes || [];
+    document.body.classList.toggle("can-zoom", modes.indexOf("fullscreen") >= 0);
+    if (hostContext.displayMode) {
+      displayMode = hostContext.displayMode;
+      document.body.classList.toggle("fullscreen", displayMode === "fullscreen");
+    }
+    reportSize();
+  }
+
+  // While the frames are being pulled: one placeholder per requested moment.
+  function onInput(args) {
+    if (root.querySelector("img")) return;
+    var moments = Array.isArray(args.moments) ? args.moments.slice(0, 3) : [args];
+    var frag = document.createDocumentFragment();
+    moments.forEach(function (m) {
+      var fig = el("figure");
+      var cap = el("figcaption");
+      cap.append(el("span", "label", (m && m.label) || "Finding the moment…"));
+      fig.append(cap, el("div", "skeleton"));
+      frag.append(fig);
+    });
+    root.replaceChildren(frag);
+    reportSize();
+  }
+
+  // The frames arrive inside the tool result: caption text, then the image.
+  // structuredContent.frames names each image block in order. If a host hands
+  // over a result without the image data, the frame is fetched by id through
+  // the app-only moment_frame tool.
+  function onResult(result) {
+    var sc = result.structuredContent || {};
+    var frames = Array.isArray(sc.frames) ? sc.frames : [];
+    var images = (result.content || []).filter(function (b) { return b && b.type === "image" && b.data; });
+    if (!frames.length && !images.length) {
+      var t = (result.content || []).filter(function (b) { return b && b.type === "text"; })[0];
+      setStatus(t ? t.text : "No frames for that moment.");
+      return;
+    }
+    var list = frames.length ? frames : images.map(function (_, i) { return { index: i }; });
+    var frag = document.createDocumentFragment();
+    list.forEach(function (f, i) {
+      var fig = el("figure");
+      var cap = el("figcaption");
+      if (f.label) cap.append(el("span", "label", f.label));
+      var meta = [f.what, f.when].filter(Boolean).join(" · ");
+      if (meta) cap.append(el("span", "meta", meta));
+      var btn = el("button", "shot");
+      btn.type = "button";
+      var img = document.createElement("img");
+      img.alt = f.label || f.what || "Screen frame";
+      if (f.width && f.height) { img.width = f.width; img.height = f.height; }
+      img.addEventListener("load", reportSize);
+      var block = images[f.index != null ? f.index : i];
+      if (block) img.src = "data:" + (block.mimeType || "image/jpeg") + ";base64," + block.data;
+      else if (f.id) fetchFrame(f.id, img);
+      btn.append(img);
+      btn.addEventListener("click", toggleFullscreen);
+      fig.append(cap, btn);
+      frag.append(fig);
+    });
+    root.replaceChildren(frag);
+    reportSize();
+  }
+
+  function fetchFrame(id, img) {
+    request("tools/call", { name: "moment_frame", arguments: { id: id } }).then(function (r) {
+      var b = ((r && r.content) || []).filter(function (x) { return x.type === "image" && x.data; })[0];
+      if (b) img.src = "data:" + (b.mimeType || "image/jpeg") + ";base64," + b.data;
+      else img.alt = "Frame unavailable";
+    }).catch(function () { img.alt = "Frame unavailable"; });
+  }
+
+  function toggleFullscreen() {
+    var modes = hostContext.availableDisplayModes || [];
+    if (modes.indexOf("fullscreen") < 0) return;
+    var want = displayMode === "fullscreen" ? "inline" : "fullscreen";
+    request("ui/request-display-mode", { mode: want }).then(function (r) {
+      applyContext({ displayMode: (r && r.mode) || want });
+    }).catch(function () {});
+  }
+
+  var lastHeight = 0;
+  function reportSize() {
+    var h = Math.ceil(document.documentElement.getBoundingClientRect().height);
+    if (h > 0 && h !== lastHeight) { lastHeight = h; notify("ui/notifications/size-changed", { height: h }); }
+  }
+  if (window.ResizeObserver) new ResizeObserver(reportSize).observe(document.documentElement);
+
+  request("ui/initialize", {
+    appInfo: { name: "ReMynd moments", version: "1.0.0" },
+    appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+    protocolVersion: "2026-01-26"
+  }).then(function (res) {
+    applyContext((res && res.hostContext) || {});
+    notify("ui/notifications/initialized", {});
+  }).catch(function () {
+    notify("ui/notifications/initialized", {});
+  });
+})();
+</script>
+</body>
+</html>
