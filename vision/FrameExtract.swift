@@ -295,6 +295,165 @@ func materializeHLS(chunk: Chunk, source: HLSSource, upToSecond: Double) -> (URL
 }
 
 
+// ---------------------------------------------------------------------------
+// One display, not the whole desk
+//
+// With several displays attached, ReMynd records ONE canvas: every display
+// laid out as macOS arranges them (4270x1187 = a 1710x1107 laptop beside a
+// 2560x1080 monitor). Showing that canvas whole shrinks the display the user
+// was working on to a third of the image, and a display that was asleep or
+// lid-closed arrives as a slab of pure black beside it.
+//
+// So each frame is cut down to one display:
+//   1. the layout comes from ScreenSetup (NSScreen coordinates, bottom-left
+//      origin), and is only trusted when its bounding box has the canvas's
+//      shape — a display unplugged mid-chunk must not re-slice a canvas that
+//      still has the old shape;
+//   2. displays that are blank (nothing captured) are dropped;
+//   3. if more than one still has content, the one holding the focused window
+//      wins. The window rect comes from OCRSurfaceInterval (CG-global points,
+//      top-left origin, the main display's top edge at y=0). The mouse is NOT
+//      used: it is routinely parked on the other display while typing.
+// If none of that settles it, the whole canvas is shown, as before.
+// ---------------------------------------------------------------------------
+
+struct ScreenLayout { let epoch: Double; let frames: [CGRect] }
+struct WindowSpan { let start: Double; let end: Double; let rect: CGRect }
+
+/// "epoch|x,y,w,h;x,y,w,h" per line, from ScreenSetup.
+func loadScreenLayouts(_ path: String) -> [ScreenLayout] {
+    guard !path.isEmpty, let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    var out: [ScreenLayout] = []
+    for line in text.split(separator: "\n") {
+        let parts = line.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2, let e = Double(parts[0]) else { continue }
+        var rects: [CGRect] = []
+        for r in parts[1].split(separator: ";") {
+            let v = r.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if v.count == 4, v[2] > 0, v[3] > 0 { rects.append(CGRect(x: v[0], y: v[1], width: v[2], height: v[3])) }
+        }
+        if !rects.isEmpty { out.append(ScreenLayout(epoch: e, frames: rects)) }
+    }
+    return out.sorted { $0.epoch < $1.epoch }
+}
+
+/// "start|end|x|y|w|h" per line, from OCRSurfaceInterval.
+func loadWindowSpans(_ path: String) -> [WindowSpan] {
+    guard !path.isEmpty, let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    var out: [WindowSpan] = []
+    for line in text.split(separator: "\n") {
+        let v = line.split(separator: "|").compactMap { Double($0) }
+        guard v.count == 6, v[4] > 0, v[5] > 0 else { continue }
+        out.append(WindowSpan(start: v[0], end: v[1], rect: CGRect(x: v[2], y: v[3], width: v[4], height: v[5])))
+    }
+    return out.sorted { $0.start < $1.start }
+}
+
+func bboxOf(_ rects: [CGRect]) -> CGRect { rects.dropFirst().reduce(rects[0]) { $0.union($1) } }
+func area(_ r: CGRect) -> Double { r.isNull || r.isEmpty ? 0 : Double(r.width * r.height) }
+
+/// Canvas size from the chunk folder name: "...-4270x1187" (maybe "-unreadable" after).
+func canvasSize(chunkName: String) -> CGSize? {
+    for part in chunkName.split(separator: "-").reversed() {
+        let wh = part.split(separator: "x")
+        if wh.count == 2, let w = Double(wh[0]), let h = Double(wh[1]), w > 0, h > 0 {
+            return CGSize(width: w, height: h)
+        }
+    }
+    return nil
+}
+
+/// Display rects in canvas pixels (top-left origin) for a frame at `epoch`.
+func displayRects(at epoch: Double, canvas: CGSize, layouts: [ScreenLayout])
+    -> (rects: [CGRect], layout: ScreenLayout, scale: Double)? {
+    guard canvas.width > 0, canvas.height > 0, !layouts.isEmpty else { return nil }
+    func fit(_ l: ScreenLayout) -> Double? {
+        let b = bboxOf(l.frames)
+        guard b.width > 0, b.height > 0 else { return nil }
+        let s = Double(canvas.width / b.width)
+        return abs(Double(b.height) * s - Double(canvas.height)) <= max(2, Double(canvas.height) * 0.01) ? s : nil
+    }
+    var chosen: (ScreenLayout, Double)? = nil
+    for l in layouts.reversed() where l.epoch <= epoch {
+        if let s = fit(l) { chosen = (l, s); break }
+    }
+    if chosen == nil {
+        for l in layouts where l.epoch > epoch { if let s = fit(l) { chosen = (l, s); break } }
+    }
+    guard let (layout, s) = chosen else { return nil }
+    let b = bboxOf(layout.frames)
+    let rects = layout.frames.map { f in
+        CGRect(x: Double(f.minX - b.minX) * s, y: Double(b.maxY - f.maxY) * s,
+               width: Double(f.width) * s, height: Double(f.height) * s).integral
+    }
+    return (rects, layout, s)
+}
+
+/// A CG-global window rect (top-left origin, main display's top at y=0) in canvas pixels.
+func windowCanvasRect(_ w: CGRect, layout: ScreenLayout, scale s: Double) -> CGRect {
+    let b = bboxOf(layout.frames)
+    let main = layout.frames.first(where: { $0.minX == 0 && $0.minY == 0 }) ?? layout.frames[0]
+    let nsMaxY = main.maxY - w.minY
+    return CGRect(x: Double(w.minX - b.minX) * s, y: Double(b.maxY - nsMaxY) * s,
+                  width: Double(w.width) * s, height: Double(w.height) * s)
+}
+
+/// True when a region holds nothing: an uncaptured display is exactly zero.
+func isBlank(_ img: CGImage, region: CGRect) -> Bool {
+    guard let sub = img.cropping(to: region) else { return false }
+    let side = 96
+    var px = [UInt8](repeating: 0, count: side * side)
+    let drew: Bool = px.withUnsafeMutableBytes { raw -> Bool in
+        guard let ctx = CGContext(data: raw.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                                  bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+        ctx.interpolationQuality = .medium
+        ctx.draw(sub, in: CGRect(x: 0, y: 0, width: side, height: side))
+        return true
+    }
+    guard drew else { return false }
+    let lit = px.reduce(0) { $0 + ($1 > 6 ? 1 : 0) }
+    return lit * 1000 < px.count * 5          // under 0.5% of samples above near-black
+}
+
+/// Which part of the decoded image to keep: (rect in image pixels, display index, display count).
+/// nil means keep the whole canvas.
+func chooseDisplay(img: CGImage, epoch: Double, canvas: CGSize,
+                   layouts: [ScreenLayout], windows: [WindowSpan]) -> (CGRect, Int, Int)? {
+    guard let d = displayRects(at: epoch, canvas: canvas, layouts: layouts), d.rects.count > 1 else { return nil }
+    let k = Double(img.width) / Double(canvas.width)
+    let bounds = CGRect(x: 0, y: 0, width: img.width, height: img.height)
+    let inImage = d.rects.map { r in
+        CGRect(x: Double(r.minX) * k, y: Double(r.minY) * k,
+               width: Double(r.width) * k, height: Double(r.height) * k).integral.intersection(bounds)
+    }
+    let lit = inImage.indices.filter { area(inImage[$0]) > 0 && !isBlank(img, region: inImage[$0]) }
+    if lit.count == 1 { return (inImage[lit[0]], lit[0], d.rects.count) }
+    guard lit.count > 1 else { return nil }
+    if let w = windows.last(where: { $0.start - 1 <= epoch && epoch <= $0.end + 1 }) {
+        let wr = windowCanvasRect(w.rect, layout: d.layout, scale: d.scale)
+        let best = lit.max { area(d.rects[$0].intersection(wr)) < area(d.rects[$1].intersection(wr)) }!
+        if area(d.rects[best].intersection(wr)) > 0 { return (inImage[best], best, d.rects.count) }
+    }
+    return nil
+}
+
+/// Scale so the longest edge is at most `maxEdge`.
+func scaledToFit(_ img: CGImage, maxEdge: Int) -> CGImage {
+    let longest = max(img.width, img.height)
+    guard maxEdge > 0, longest > maxEdge else { return img }
+    let f = Double(maxEdge) / Double(longest)
+    let w = max(1, Int((Double(img.width) * f).rounded()))
+    let h = max(1, Int((Double(img.height) * f).rounded()))
+    guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return img }
+    ctx.interpolationQuality = .high
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage() ?? img
+}
+
+
 /// Reads frames.pts (preferred) or frames.log (fallback) into an absolute timeline.
 func loadFrames(chunkDir: URL) -> [Frame] {
     let ptsURL = chunkDir.appendingPathComponent("frames.pts")
@@ -465,6 +624,9 @@ struct Options {
     var report: Bool = false         // final human-readable report (remynd-vision)
     var spansFile: String = ""       // "start|end|App" lines: frontmost-app timeline
     var note: String = ""
+    var cropDisplay: Bool = false    // cut each frame to one display (see "One display")
+    var screensFile: String = ""
+    var windowsFile: String = ""
 }
 
 /// Frontmost-app spans handed over by remynd-vision, one "start|end|App" per line.
@@ -479,7 +641,7 @@ func loadSpans(_ path: String) -> [(Double, Double, String)] {
     return out
 }
 
-struct FrameOut { let path: String; let epoch: Double; let chunk: String; let index: Int }
+struct FrameOut { let path: String; let epoch: Double; let chunk: String; let index: Int; var display: Int? = nil; var displays: Int? = nil }
 
 /// Writes the final result: each frame labelled with the app that was frontmost.
 ///
@@ -499,9 +661,11 @@ func emitResult(_ o: Options, frames: [FrameOut], considered: Int, deduped: Int,
     if frames.isEmpty, let r = reason, !r.isEmpty { note = note.isEmpty ? r : note + ". " + r }
 
     if o.json {
-        let rows: [[String: Any]] = frames.map {
-            ["path": $0.path, "time": isoLocal($0.epoch), "epoch": $0.epoch,
-             "chunk": $0.chunk, "frame": $0.index, "app": appAt($0.epoch)]
+        let rows: [[String: Any]] = frames.map { f -> [String: Any] in
+            var r: [String: Any] = ["path": f.path, "time": isoLocal(f.epoch), "epoch": f.epoch,
+                                    "chunk": f.chunk, "frame": f.index, "app": appAt(f.epoch)]
+            if let d = f.display, let n = f.displays { r["display"] = d + 1; r["displays"] = n }
+            return r
         }
         var obj: [String: Any] = ["frames": rows, "note": note, "considered": considered,
                                   "deduped": deduped, "unreadable": unreadable]
@@ -562,6 +726,9 @@ func parseArgs() -> Options {
         case "--report": o.report = true
         case "--spans": o.spansFile = next("--spans")
         case "--note": o.note = next("--note")
+        case "--display-crop": o.cropDisplay = next("--display-crop") != "off"
+        case "--screens": o.screensFile = next("--screens")
+        case "--windows": o.windowsFile = next("--windows")
         case "-h", "--help":
             print("""
             remynd-frames --profile <ReMynd profile> --out <dir>
@@ -587,6 +754,8 @@ func parseArgs() -> Options {
 // MARK: - Main
 
 let opts = parseArgs()
+let screenLayouts = loadScreenLayouts(opts.screensFile)
+let windowSpans = loadWindowSpans(opts.windowsFile)
 
 let recordings = URL(fileURLWithPath: opts.profile).appendingPathComponent("Recordings")
 guard FileManager.default.fileExists(atPath: recordings.path) else {
@@ -675,9 +844,18 @@ var decoders: [String: Decoder?] = [:]
 func decoder(for chunk: Chunk) -> Decoder? {
     if let cached = decoders[chunk.name] { return cached }
     func build() -> Decoder? {
+        // Cropping to one display needs the canvas at full resolution first:
+        // downscaling the whole desk and then cropping leaves a 2560px display
+        // about 940px wide.
+        var decodeWidth = opts.width
+        if opts.cropDisplay, let canvas = canvasSize(chunkName: chunk.name),
+           (displayRects(at: chunk.start, canvas: canvas, layouts: screenLayouts)?.rects.count ?? 0) > 1
+            || (displayRects(at: chunk.end, canvas: canvas, layouts: screenLayouts)?.rects.count ?? 0) > 1 {
+            decodeWidth = max(opts.width, Int(canvas.width))
+        }
         var movie = chunk.movie(quality: opts.quality)
         var hlsDuration: Double? = nil
-        if movie == nil, let src = chunk.hlsSource(minWidth: opts.width) {
+        if movie == nil, let src = chunk.hlsSource(minWidth: decodeWidth) {
             // Decrypt only as far as the latest frame we will ask for.
             let needed = sampled.filter { $0.chunk.name == chunk.name }.map { $0.frame.index }.max() ?? 0
             let fpsGuess = Double(chunk.frames.count) / max(0.001, src.segments.reduce(0) { $0 + $1.duration })
@@ -701,7 +879,7 @@ func decoder(for chunk: Chunk) -> Decoder? {
         g.appliesPreferredTrackTransform = true
         g.requestedTimeToleranceBefore = .zero
         g.requestedTimeToleranceAfter = .zero
-        g.maximumSize = CGSize(width: opts.width, height: opts.width)
+        g.maximumSize = CGSize(width: decodeWidth, height: decodeWidth)
         return Decoder(generator: g, fps: fps, duration: duration)
     }
     let built = build()
@@ -714,6 +892,8 @@ struct Emitted {
     let epoch: Double
     let chunk: String
     let index: Int
+    var display: Int? = nil
+    var displays: Int? = nil
 }
 
 var emitted: [Emitted] = []
@@ -728,10 +908,20 @@ for cand in sampled {
     if dec.duration > 0 && offset > dec.duration { unreadable += 1; continue }
     let time = CMTime(value: Int64((offset * PTS_TIMESCALE).rounded()),
                       timescale: Int32(PTS_TIMESCALE))
-    guard let cg = try? dec.generator.copyCGImage(at: time, actualTime: nil) else {
+    guard let decoded = try? dec.generator.copyCGImage(at: time, actualTime: nil) else {
         unreadable += 1
         continue
     }
+    var cg = decoded
+    var shownDisplay: (Int, Int)? = nil
+    if opts.cropDisplay, let canvas = canvasSize(chunkName: cand.chunk.name),
+       let pick = chooseDisplay(img: decoded, epoch: cand.frame.epoch, canvas: canvas,
+                                layouts: screenLayouts, windows: windowSpans),
+       let cropped = decoded.cropping(to: pick.0) {
+        cg = cropped
+        shownDisplay = (pick.1, pick.2)
+    }
+    cg = scaledToFit(cg, maxEdge: opts.width)
 
     if opts.dedupeDistance > 0 {
         let h = averageHash(cg)
@@ -749,13 +939,14 @@ for cand in sampled {
     let url = outDir.appendingPathComponent(name)
     guard writePNG(cg, to: url) else { continue }
     emitted.append(Emitted(path: url.path, epoch: cand.frame.epoch,
-                           chunk: cand.chunk.name, index: cand.frame.index))
+                           chunk: cand.chunk.name, index: cand.frame.index,
+                           display: shownDisplay?.0, displays: shownDisplay?.1))
 }
 
 if opts.json || opts.report {
     removeScratch()
     emitResult(opts,
-               frames: emitted.map { FrameOut(path: $0.path, epoch: $0.epoch, chunk: $0.chunk, index: $0.index) },
+               frames: emitted.map { FrameOut(path: $0.path, epoch: $0.epoch, chunk: $0.chunk, index: $0.index, display: $0.display, displays: $0.displays) },
                considered: candidates.count, deduped: skippedDuplicates, unreadable: unreadable,
                reason: emitted.isEmpty ? hlsKeyFailure : nil)
 } else {

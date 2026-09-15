@@ -36,6 +36,7 @@ PREFER="motion"
 OUT=""
 QUALITY="high"
 FORMAT="text"
+ALL_DISPLAYS=0
 
 usage() {
   cat <<'EOF'
@@ -52,6 +53,8 @@ remynd-vision — extract the real screen frames from ReMynd's recordings
   --quality high|half|small
   --out <dir>            where to write PNGs (default: a temp dir)
   --json                 machine-readable manifest
+  --all-displays         keep the whole multi-display canvas (default: crop each
+                         frame to the display that has content / the focused window)
 
 Examples
   remynd-vision --since 5m                    what was on screen just now
@@ -73,6 +76,7 @@ while [ $# -gt 0 ]; do
     --quality) QUALITY="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --json) FORMAT="json"; shift ;;
+    --all-displays) ALL_DISPLAYS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "remynd-vision: unknown option $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -306,8 +310,38 @@ mkdir -p "$OUT" || { echo "remynd-vision: cannot create $OUT" >&2; exit 1; }
 # Bash and the compiled extractor only, from here on.
 SPANS="$(mktemp "${TMPDIR:-/tmp}/remynd-vision-spans.XXXXXX")" \
   || { echo "remynd-vision: cannot create a temp file" >&2; exit 1; }
-trap 'rm -f "$SPANS"' EXIT
+SCREENS="$(mktemp "${TMPDIR:-/tmp}/remynd-vision-screens.XXXXXX")" \
+  || { rm -f "$SPANS"; echo "remynd-vision: cannot create a temp file" >&2; exit 1; }
+WINDOWS="$(mktemp "${TMPDIR:-/tmp}/remynd-vision-windows.XXXXXX")" \
+  || { rm -f "$SPANS" "$SCREENS"; echo "remynd-vision: cannot create a temp file" >&2; exit 1; }
+trap 'rm -f "$SPANS" "$SCREENS" "$WINDOWS"' EXIT
 printf '%s\n' "$ROWS" > "$SPANS"
+
+# A multi-display desk is recorded as one wide canvas. The extractor cuts each
+# frame to a single display — the one with content, or the one holding the
+# focused window — using the screen layouts (ScreenSetup, NSScreen coordinates)
+# and the focused-window rects (OCRSurfaceInterval, CG-global points) here.
+# app.db is UTC; strftime('%s') reads it as UTC.
+START_UTC="$(date -u -r "$START" '+%Y-%m-%d %H:%M:%S')"
+END_UTC="$(date -u -r "$END" '+%Y-%m-%d %H:%M:%S')"
+"$SQLITE" -readonly -noheader -separator '|' "file:$DB?mode=ro" "
+  SELECT CAST(strftime('%s', s.date) AS INTEGER),
+         group_concat(json_extract(j.value, '\$.frame[0][0]') || ',' || json_extract(j.value, '\$.frame[0][1]')
+                      || ',' || json_extract(j.value, '\$.frame[1][0]') || ',' || json_extract(j.value, '\$.frame[1][1]'), ';')
+  FROM ScreenSetup s, json_each(s.screens) j
+  WHERE s.date <= '$END_UTC'
+  GROUP BY s.id
+  ORDER BY s.date;" > "$SCREENS" 2>/dev/null
+"$SQLITE" -readonly -noheader -separator '|' "file:$DB?mode=ro" "
+  SELECT CAST(strftime('%s', startedAt) AS INTEGER),
+         CAST(strftime('%s', COALESCE(endedAt, datetime('now'))) AS INTEGER),
+         screenX, screenY, screenWidth, screenHeight
+  FROM OCRSurfaceInterval
+  WHERE startedAt <= '$END_UTC' AND COALESCE(endedAt, '9999') >= '$START_UTC'
+    AND screenWidth > 0 AND screenHeight > 0
+  ORDER BY startedAt;" > "$WINDOWS" 2>/dev/null
+CROP="on"
+[ "$ALL_DISPLAYS" -eq 1 ] && CROP="off"
 
 MODE_FLAG="--report"
 [ "$FORMAT" = "json" ] && MODE_FLAG="--json"
@@ -322,6 +356,9 @@ OUTPUT="$("$EXTRACT" \
   --out "$OUT" \
   --spans "$SPANS" \
   --note "$NOTE" \
+  --display-crop "$CROP" \
+  --screens "$SCREENS" \
+  --windows "$WINDOWS" \
   "$MODE_FLAG" 2>/dev/null)"
 
 if [ -z "$OUTPUT" ]; then
