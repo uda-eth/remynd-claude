@@ -62,6 +62,7 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
 /// Runs one of ReMynd's bash tools (the CLI, or the frame extractor) and
 /// returns its stdout. Same pipe discipline for both — see the comments.
 func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: Bool) {
+    let label = (script as NSString).lastPathComponent
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/bash")
     p.arguments = [script] + args
@@ -134,20 +135,25 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     // Never report emptiness as if it were an answer. An empty result with a
     // zero exit is a real "nothing found"; anything else is a fault, and the
     // model needs to see which so it can react instead of guessing.
+    let complaint = errText.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         if p.terminationStatus != 0 {
-            return ("The ReMynd CLI failed (exit \(p.terminationStatus)) and produced no output. "
-                    + "Command: remynd \(args.joined(separator: " "))", false)
+            // Name the tool that failed and pass on what it said. A bare "the
+            // CLI failed (exit 69)" hid an unaccepted Xcode license: the frame
+            // script's /usr/bin/python3 is an Xcode shim, and the reason was on
+            // stderr the whole time.
+            return ("\(label) failed (exit \(p.terminationStatus)) and produced no output"
+                    + (complaint.isEmpty ? ". " : ": " + String(complaint.prefix(400)) + " ")
+                    + "Command: \(label) \(args.joined(separator: " "))", false)
         }
         // Distinguish "nothing matched" from "something went wrong and I still
         // have nothing". Saying "matched nothing" when the CLI was complaining
         // the whole time is what sent this bug hunting through the database.
-        let complaint = errText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !complaint.isEmpty {
-            return ("No output for: remynd \(args.joined(separator: " ")), but the CLI reported: "
+            return ("No output for: \(label) \(args.joined(separator: " ")), but it reported: "
                     + String(complaint.prefix(400)), false)
         }
-        return ("No results for: remynd \(args.joined(separator: " ")). "
+        return ("No results for: \(label) \(args.joined(separator: " ")). "
                 + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)
     }
     return (text, p.terminationStatus == 0)
@@ -470,6 +476,7 @@ func showMomentContent(_ a: [String: Any]) -> ([[String: Any]], Bool) {
         var why = "No recorded frames within ±\(halfWindow)s of \(momentSecondsIn.string(from: at))"
         if let app = app, !app.isEmpty { why += " while \(app) was frontmost" }
         if let note = obj["note"] as? String, !note.isEmpty { why += " (\(note))" }
+        else if let reason = obj["reason"] as? String, !reason.isEmpty { why += " (\(reason))" }
         why += ". ReMynd may have been paused, the Mac asleep, or the app excluded from agent access. Try a wider window_seconds, drop the app filter, or check sync_status."
         return fail(why, isError: false)
     }

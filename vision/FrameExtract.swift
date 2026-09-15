@@ -462,6 +462,64 @@ struct Options {
     var quality: String = "high"
     var dedupeDistance: Int = 6      // 0 disables
     var json: Bool = false
+    var report: Bool = false         // final human-readable report (remynd-vision)
+    var spansFile: String = ""       // "start|end|App" lines: frontmost-app timeline
+    var note: String = ""
+}
+
+/// Frontmost-app spans handed over by remynd-vision, one "start|end|App" per line.
+func loadSpans(_ path: String) -> [(Double, Double, String)] {
+    guard !path.isEmpty, let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    var out: [(Double, Double, String)] = []
+    for line in text.split(separator: "\n") {
+        let f = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+        guard f.count == 3, let a = Double(f[0]), let b = Double(f[1]) else { continue }
+        out.append((a, b, String(f[2])))
+    }
+    return out
+}
+
+struct FrameOut { let path: String; let epoch: Double; let chunk: String; let index: Int }
+
+/// Writes the final result: each frame labelled with the app that was frontmost.
+///
+/// This used to be a python3 heredoc inside remynd-vision. /usr/bin/python3 is
+/// an Xcode shim, and an Xcode update that leaves the license unaccepted makes
+/// every shim exit 69 — which took every frame request down with it. The
+/// labelling is trivial, so it lives here now and the frame path needs nothing
+/// but bash and this binary.
+func emitResult(_ o: Options, frames: [FrameOut], considered: Int, deduped: Int,
+                unreadable: Int, reason: String?) {
+    let spans = loadSpans(o.spansFile)
+    func appAt(_ t: Double) -> String {
+        for (a, b, name) in spans where t >= a && t <= b { return name }
+        return ""
+    }
+    var note = o.note
+    if frames.isEmpty, let r = reason, !r.isEmpty { note = note.isEmpty ? r : note + ". " + r }
+
+    if o.json {
+        let rows: [[String: Any]] = frames.map {
+            ["path": $0.path, "time": isoLocal($0.epoch), "epoch": $0.epoch,
+             "chunk": $0.chunk, "frame": $0.index, "app": appAt($0.epoch)]
+        }
+        var obj: [String: Any] = ["frames": rows, "note": note, "considered": considered,
+                                  "deduped": deduped, "unreadable": unreadable]
+        if let r = reason, !r.isEmpty { obj["reason"] = r }
+        if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .withoutEscapingSlashes]),
+           let text = String(data: d, encoding: .utf8) { print(text) }
+        return
+    }
+    if frames.isEmpty {
+        print("No frames: \((reason?.isEmpty == false ? reason : nil) ?? "no distinct frames in that window")")
+        return
+    }
+    if !note.isEmpty { print("note: \(note)") }
+    print("\(frames.count) frame(s) — \(considered) captured, \(deduped) dropped as near-identical\n")
+    for f in frames {
+        let app = appAt(f.epoch)
+        print("\(isoLocal(f.epoch))\(app.isEmpty ? "" : "  [\(app)]")\n  \(f.path)")
+    }
 }
 
 func fail(_ msg: String) -> Never {
@@ -501,6 +559,9 @@ func parseArgs() -> Options {
         case "--quality": o.quality = next("--quality")
         case "--dedupe": o.dedupeDistance = Int(next("--dedupe")) ?? 6
         case "--json": o.json = true
+        case "--report": o.report = true
+        case "--spans": o.spansFile = next("--spans")
+        case "--note": o.note = next("--note")
         case "-h", "--help":
             print("""
             remynd-frames --profile <ReMynd profile> --out <dir>
@@ -536,7 +597,7 @@ let spanFrom = opts.ranges.first!.0
 let spanTo = opts.ranges.map(\.1).max()!
 let chunks = discoverChunks(recordings: recordings, from: spanFrom, to: spanTo)
 if chunks.isEmpty {
-    if opts.json { print("{\"frames\":[],\"reason\":\"no recording covers that range\"}") }
+    if opts.json || opts.report { emitResult(opts, frames: [], considered: 0, deduped: 0, unreadable: 0, reason: "no recording covers that range") }
     else { FileHandle.standardError.write("remynd-frames: no recording covers that range\n".data(using: .utf8)!) }
     exit(0)
 }
@@ -560,7 +621,7 @@ for c in chunks {
 candidates.sort { $0.frame.epoch < $1.frame.epoch }
 
 if candidates.isEmpty {
-    if opts.json { print("{\"frames\":[],\"reason\":\"recording exists but captured no frames in that range\"}") }
+    if opts.json || opts.report { emitResult(opts, frames: [], considered: 0, deduped: 0, unreadable: 0, reason: "recording exists but captured no frames in that range") }
     exit(0)
 }
 
@@ -691,20 +752,12 @@ for cand in sampled {
                            chunk: cand.chunk.name, index: cand.frame.index))
 }
 
-if opts.json {
-    var parts: [String] = []
-    for e in emitted {
-        let esc = e.path.replacingOccurrences(of: "\"", with: "\\\"")
-        parts.append("""
-        {"path":"\(esc)","time":"\(isoLocal(e.epoch))","epoch":\(e.epoch),"chunk":"\(e.chunk)","frame":\(e.index)}
-        """)
-    }
-    var reason = ""
-    if emitted.isEmpty, let why = hlsKeyFailure {
-        reason = ",\"reason\":\"" + why.replacingOccurrences(of: "\"", with: "'") + "\""
-    }
-    print("{\"frames\":[\(parts.joined(separator: ","))],\"considered\":\(candidates.count),\"deduped\":\(skippedDuplicates),\"unreadable\":\(unreadable)\(reason)}")
+if opts.json || opts.report {
     removeScratch()
+    emitResult(opts,
+               frames: emitted.map { FrameOut(path: $0.path, epoch: $0.epoch, chunk: $0.chunk, index: $0.index) },
+               considered: candidates.count, deduped: skippedDuplicates, unreadable: unreadable,
+               reason: emitted.isEmpty ? hlsKeyFailure : nil)
 } else {
     if emitted.isEmpty, let why = hlsKeyFailure {
         FileHandle.standardError.write(("remynd-frames: " + why + "\n").data(using: .utf8)!)

@@ -276,14 +276,17 @@ fi
 RANGES="$(build_ranges "$MODE")"
 
 # If filtering left nothing, say so and widen rather than returning silence.
+# The note is only true when the widened pass actually found something: with
+# no focus rows at all it used to claim "only the terminal was frontmost"
+# about a stretch where nothing was recorded.
 if [ -z "$RANGES" ] && [ "$MODE" = "only-app" ]; then
   echo "remynd-vision: '$APP' was never frontmost in that window" >&2
   RANGES="$(build_ranges none)"
-  NOTE="no frames of '$APP'; showing whatever was on screen instead"
+  [ -n "$RANGES" ] && NOTE="no frames of '$APP'; showing whatever was on screen instead"
 fi
 if [ -z "$RANGES" ] && [ "$MODE" = "exclude-agent" ]; then
   RANGES="$(build_ranges none)"
-  NOTE="only the terminal was frontmost; showing it"
+  [ -n "$RANGES" ] && NOTE="only the terminal was frontmost; showing it"
 fi
 if [ -z "$RANGES" ]; then
   RANGES="$START:$END"
@@ -296,7 +299,20 @@ if [ -z "$OUT" ]; then
 fi
 mkdir -p "$OUT" || { echo "remynd-vision: cannot create $OUT" >&2; exit 1; }
 
-MANIFEST="$("$EXTRACT" \
+# The frontmost-app timeline goes to the extractor, which labels each frame and
+# writes the final report itself. This step used to be a python3 heredoc, and
+# /usr/bin/python3 is an Xcode shim: an Xcode update left its license
+# unaccepted, every shim exited 69, and every frame request failed with it.
+# Bash and the compiled extractor only, from here on.
+SPANS="$(mktemp "${TMPDIR:-/tmp}/remynd-vision-spans.XXXXXX")" \
+  || { echo "remynd-vision: cannot create a temp file" >&2; exit 1; }
+trap 'rm -f "$SPANS"' EXIT
+printf '%s\n' "$ROWS" > "$SPANS"
+
+MODE_FLAG="--report"
+[ "$FORMAT" = "json" ] && MODE_FLAG="--json"
+
+OUTPUT="$("$EXTRACT" \
   --profile "$PROFILE" \
   --ranges "$RANGES" \
   --max "$MAX" \
@@ -304,60 +320,12 @@ MANIFEST="$("$EXTRACT" \
   --quality "$QUALITY" \
   --prefer "$PREFER" \
   --out "$OUT" \
-  --json 2>/dev/null)"
+  --spans "$SPANS" \
+  --note "$NOTE" \
+  "$MODE_FLAG" 2>/dev/null)"
 
-if [ -z "$MANIFEST" ]; then
+if [ -z "$OUTPUT" ]; then
   echo "remynd-vision: the extractor returned nothing" >&2
   exit 1
 fi
-
-# Attach the frontmost app to each frame so the agent knows what it is looking at.
-export MANIFEST OUT NOTE FORMAT ROWS
-python3 - <<'PY'
-import json, os, sys
-
-manifest = json.loads(os.environ["MANIFEST"])
-frames = manifest.get("frames", [])
-note = os.environ.get("NOTE", "")
-if not manifest.get("frames") and manifest.get("reason"):
-    note = (note + " " if note else "") + manifest["reason"]
-
-# Frontmost-app timeline, so each frame can be labelled with its app.
-spans = []
-for line in os.environ.get("ROWS", "").splitlines():
-    parts = line.split("|")
-    if len(parts) < 3:
-        continue
-    try:
-        spans.append((int(parts[0]), int(parts[1]), parts[2]))
-    except ValueError:
-        continue
-
-def app_at(epoch):
-    for a, b, name in spans:
-        if a <= epoch <= b:
-            return name
-    return ""
-
-for f in frames:
-    f["app"] = app_at(f["epoch"])
-
-if os.environ.get("FORMAT") == "json":
-    print(json.dumps({"frames": frames, "note": note,
-                      "considered": manifest.get("considered", 0),
-                      "deduped": manifest.get("deduped", 0)}, indent=2))
-    sys.exit(0)
-
-if not frames:
-    reason = manifest.get("reason", "no distinct frames in that window")
-    print(f"No frames: {reason}")
-    sys.exit(0)
-
-if note:
-    print(f"note: {note}")
-print(f"{len(frames)} frame(s) — {manifest.get('considered', 0)} captured, "
-      f"{manifest.get('deduped', 0)} dropped as near-identical\n")
-for f in frames:
-    app = f"  [{f['app']}]" if f["app"] else ""
-    print(f"{f['time']}{app}\n  {f['path']}")
-PY
+printf '%s\n' "$OUTPUT"

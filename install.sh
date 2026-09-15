@@ -138,6 +138,12 @@ if [ -n "$VISION_SRC" ]; then
   install_binary "$VISION_SRC/remynd-vision" "$BIN_DIR/remynd-vision" || true
   cp "$VISION_SRC/remynd-vision-hook.py" "$VISION_SRC/remynd-vision-intro.sh" "$CORE_DIR/" 2>/dev/null || true
   chmod +x "$CORE_DIR/remynd-vision-intro.sh" 2>/dev/null || true
+  # An Xcode update leaves its license unaccepted, and every /usr/bin developer
+  # shim (swiftc, xcrun, python3) then exits 69. The Command Line Tools carry
+  # their own toolchain and are unaffected, so fall back to them.
+  if ! /usr/bin/xcrun --find swiftc >/dev/null 2>&1 && [ -d /Library/Developer/CommandLineTools ]; then
+    export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+  fi
   if command -v swiftc >/dev/null 2>&1; then
     if (cd "$SYNC_DIR/vision" && swiftc -O -o "$BIN_DIR/remynd-frames.new.$$" FrameExtract.swift 2>/dev/null) \
        && mv -f "$BIN_DIR/remynd-frames.new.$$" "$BIN_DIR/remynd-frames"; then
