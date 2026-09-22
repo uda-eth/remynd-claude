@@ -34,6 +34,9 @@ let PTS_TIMESCALE: Double = 600
 struct Frame {
     let index: Int
     let epoch: Double        // absolute unix seconds (UTC)
+    /// Raw frames.pts value, the key ReMynd's deleted-frame records use. Nil when the
+    /// timeline came from frames.log, which only has the wall clock.
+    var pts: Int64? = nil
 
     /// Position inside the .mov, which is packed at a constant nominal rate.
     func offset(fps: Double) -> Double { Double(index) / fps }
@@ -469,7 +472,7 @@ func loadFrames(chunkDir: URL) -> [Frame] {
         guard let first = values.first, first > 0 else { return loadFramesLog(chunkDir: chunkDir) }
         _ = first
         return values.enumerated().map { (i, v) in
-            Frame(index: i, epoch: Double(v) / PTS_TIMESCALE)
+            Frame(index: i, epoch: Double(v) / PTS_TIMESCALE, pts: Int64(bitPattern: v))
         }
     }
     return loadFramesLog(chunkDir: chunkDir)
@@ -751,6 +754,98 @@ func parseArgs() -> Options {
     return o
 }
 
+// MARK: - Deleted frames
+
+/// Frames the user moved to Trash stay on disk until they are compacted away, so
+/// the extractor has to hide them itself. The rules are FrameReader's:
+///   - Recordings/deleted-frames.pts   legacy tombstones, native-endian Int64 pts values
+///   - Recordings/frame-trash.json     Trash manifest; every entry hides its frame,
+///                                     whatever its state
+/// A missing file hides nothing. A file that exists but cannot be read, or fails
+/// FrameReader's validation, hides everything: ReMynd shows no frames at all then,
+/// and an agent must not see more than ReMynd shows.
+enum DeletedFrames {
+    case none
+    case hidden(Set<Int64>)
+    case unreadable(String)
+}
+
+private struct TrashManifest: Decodable {
+    struct Entry: Decodable {
+        let id: UUID
+        let framePTS: Int64
+        let recordingDirectory: String
+        let frameIndex: Int
+        let createdAt: Date
+        let updatedAt: Date
+        let state: String
+    }
+    let version: Int
+    let entries: [Entry]
+}
+
+/// FrameTrashState's raw values; an unknown state makes the manifest undecodable in the app.
+private let TRASH_STATES: Set<String> = [
+    "pendingReview", "queued", "waitingForRecording", "waitingForResources", "waitingForStorage",
+    "fetching", "compacting", "uploading", "recoveryPending", "purging", "complete", "failed",
+    "cleanupFailed",
+]
+
+private func isValidRecordingDirectory(_ path: String) -> Bool {
+    guard !path.isEmpty, !(path as NSString).isAbsolutePath else { return false }
+    return !path.split(separator: "/", omittingEmptySubsequences: false).contains {
+        $0.isEmpty || $0 == "." || $0 == ".."
+    }
+}
+
+func loadDeletedFrames(recordings: URL) -> DeletedFrames {
+    let fm = FileManager.default
+    var hidden = Set<Int64>()
+
+    let legacy = recordings.appendingPathComponent("deleted-frames.pts")
+    if fm.fileExists(atPath: legacy.path) {
+        guard let data = try? Data(contentsOf: legacy) else {
+            return .unreadable("deleted-frames.pts could not be read")
+        }
+        guard data.count % MemoryLayout<Int64>.stride == 0 else {
+            return .unreadable("deleted-frames.pts has an invalid size (\(data.count) bytes)")
+        }
+        data.withUnsafeBytes { raw in
+            for i in 0..<(raw.count / 8) {
+                hidden.insert(raw.loadUnaligned(fromByteOffset: i * 8, as: Int64.self))
+            }
+        }
+    }
+
+    let manifestURL = recordings.appendingPathComponent("frame-trash.json")
+    if fm.fileExists(atPath: manifestURL.path) {
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(TrashManifest.self, from: data) else {
+            return .unreadable("frame-trash.json could not be read")
+        }
+        let entries = manifest.entries
+        guard manifest.version == 1,
+              Set(entries.map(\.id)).count == entries.count,
+              Set(entries.map(\.framePTS)).count == entries.count,
+              entries.allSatisfy({
+                  $0.frameIndex >= 0 && isValidRecordingDirectory($0.recordingDirectory)
+                      && TRASH_STATES.contains($0.state)
+              }) else {
+            return .unreadable("frame-trash.json failed validation")
+        }
+        hidden.formUnion(entries.map(\.framePTS))
+    }
+    return hidden.isEmpty ? .none : .hidden(hidden)
+}
+
+/// A frame whose timeline came from frames.log has no exact pts, so it is hidden when a
+/// tombstone lies within one pts tick of its wall-clock time.
+func isDeleted(_ f: Frame, _ hidden: Set<Int64>) -> Bool {
+    if let pts = f.pts { return hidden.contains(pts) }
+    let approx = Int64((f.epoch * PTS_TIMESCALE).rounded())
+    return hidden.contains(approx) || hidden.contains(approx - 1) || hidden.contains(approx + 1)
+}
+
 // MARK: - Main
 
 let opts = parseArgs()
@@ -782,13 +877,31 @@ func inRange(_ t: Double) -> Bool {
     for (a, b) in opts.ranges where t >= a && t <= b { return true }
     return false
 }
+var hiddenPTS = Set<Int64>()
+switch loadDeletedFrames(recordings: recordings) {
+case .none: break
+case .hidden(let set): hiddenPTS = set
+case .unreadable(let why):
+    // Fail closed, and say why: "nothing recorded" would be a different, wrong answer.
+    let reason = "ReMynd's deleted-frame records are unreadable (\(why)), so no frames are shown"
+    if opts.json || opts.report { emitResult(opts, frames: [], considered: 0, deduped: 0, unreadable: 0, reason: reason) }
+    else { FileHandle.standardError.write("remynd-frames: \(reason)\n".data(using: .utf8)!) }
+    exit(0)
+}
+var deletedInRange = 0
 for c in chunks {
+    // Filter before sampling; each Frame keeps its own movie index.
     for f in c.frames where inRange(f.epoch) {
+        if !hiddenPTS.isEmpty && isDeleted(f, hiddenPTS) { deletedInRange += 1; continue }
         candidates.append(Candidate(chunk: c, frame: f))
     }
 }
 candidates.sort { $0.frame.epoch < $1.frame.epoch }
 
+if candidates.isEmpty && deletedInRange > 0 {
+    if opts.json || opts.report { emitResult(opts, frames: [], considered: 0, deduped: 0, unreadable: 0, reason: "every frame in that range was deleted by the user") }
+    exit(0)
+}
 if candidates.isEmpty {
     if opts.json || opts.report { emitResult(opts, frames: [], considered: 0, deduped: 0, unreadable: 0, reason: "recording exists but captured no frames in that range") }
     exit(0)

@@ -59,13 +59,178 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     return runScript(cli, args, timeout: timeout)
 }
 
+// ---------------------------------------------------------------------------
+// Child processes
+//
+// Foundation's Process can neither put the child in its own process group nor
+// give it a stdin other than ours, and both matter here. The scripts start
+// grandchildren (sqlite3, awk, the frame extractor) that inherit stdout, so
+// killing bash alone leaves the pipe open; a process group can be killed
+// whole. And our stdin is the JSON-RPC stream: a script that read from it
+// would swallow the client's next request. So: posix_spawn, stdin from
+// /dev/null, every other descriptor closed in the child.
+// ---------------------------------------------------------------------------
+
+/// Collects one pipe on its own thread. Draining both pipes concurrently
+/// matters: a child blocked writing to a full stderr never finishes stdout.
+final class PipeDrain {
+    private let lock = NSLock()
+    private var data = Data()
+    private let done = DispatchSemaphore(value: 0)
+    private var finished = false
+
+    init(fd: Int32) {
+        let t = Thread { [self] in
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                if n > 0 {
+                    lock.lock(); data.append(buf, count: n); lock.unlock()
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+            // The thread owns the descriptor: closing it anywhere else could
+            // race a read still in progress and hit a reused descriptor.
+            close(fd)
+            lock.lock(); finished = true; lock.unlock()
+            done.signal()
+        }
+        t.start()
+    }
+
+    /// Waits for EOF until `deadline`. True when the pipe closed.
+    func wait(until deadline: Date) -> Bool {
+        lock.lock(); let f = finished; lock.unlock()
+        if f { return true }
+        let remaining = max(0, deadline.timeIntervalSinceNow)
+        guard done.wait(timeout: .now() + remaining) == .success else { return false }
+        done.signal()   // leave it signalled for any later wait
+        return true
+    }
+
+    func snapshot() -> Data {
+        lock.lock(); defer { lock.unlock() }
+        return data
+    }
+}
+
+enum SpawnError: Error, CustomStringConvertible {
+    case pipe(Int32), spawn(Int32)
+    var description: String {
+        switch self {
+        case .pipe(let e): return "pipe: \(String(cString: strerror(e)))"
+        case .spawn(let e): return "posix_spawn: \(String(cString: strerror(e)))"
+        }
+    }
+}
+
+final class SpawnedChild {
+    enum Outcome { case finished, timedOut }
+
+    let pid: pid_t
+    let stdout: PipeDrain
+    let stderr: PipeDrain
+    private var reaped = false
+    private var rawStatus: Int32 = 0
+
+    /// How long a finished script's stray descendants may keep its stdout open
+    /// before they are killed. The script's own output is complete by then.
+    static let orphanGrace: TimeInterval = 2
+    /// Time between SIGTERM and SIGKILL for the process group.
+    static let killGrace: TimeInterval = 0.5
+
+    init(argv: [String], env: [String: String]) throws {
+        var outFDs: [Int32] = [-1, -1], errFDs: [Int32] = [-1, -1]
+        guard pipe(&outFDs) == 0 else { throw SpawnError.pipe(errno) }
+        guard pipe(&errFDs) == 0 else {
+            let e = errno; close(outFDs[0]); close(outFDs[1]); throw SpawnError.pipe(e)
+        }
+
+        var actions: posix_spawn_file_actions_t? = nil
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_adddup2(&actions, outFDs[1], 1)
+        posix_spawn_file_actions_adddup2(&actions, errFDs[1], 2)
+
+        var attr: posix_spawnattr_t? = nil
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // Own process group (so the whole tree can be killed), and close every
+        // descriptor the file actions did not set up.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
+        posix_spawnattr_setpgroup(&attr, 0)
+
+        let cArgs = argv.map { strdup($0) } + [nil]
+        let cEnv = env.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { cArgs.forEach { free($0) }; cEnv.forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, argv[0], &actions, &attr, cArgs, cEnv)
+        // Our copies of the write ends must close, or EOF never arrives.
+        close(outFDs[1]); close(errFDs[1])
+        guard rc == 0 else {
+            close(outFDs[0]); close(errFDs[0])
+            throw SpawnError.spawn(rc)
+        }
+        self.pid = pid
+        self.stdout = PipeDrain(fd: outFDs[0])
+        self.stderr = PipeDrain(fd: errFDs[0])
+    }
+
+    /// Exit code, or 128 + signal for a child that was killed.
+    var exitStatus: Int32 {
+        let sig = rawStatus & 0x7f
+        return sig == 0 ? (rawStatus >> 8) & 0xff : 128 + sig
+    }
+
+    private func reap(block: Bool) -> Bool {
+        if reaped { return true }
+        var st: Int32 = 0
+        var r: pid_t
+        repeat { r = waitpid(pid, &st, block ? 0 : WNOHANG) } while r < 0 && errno == EINTR
+        if r == pid { rawStatus = st; reaped = true }
+        return reaped
+    }
+
+    /// Waits for the script to exit and both pipes to close, all by `deadline`.
+    func wait(until deadline: Date) -> Outcome {
+        while !reap(block: false) {
+            if Date() >= deadline { killGroup(); return .timedOut }
+            usleep(10_000)
+        }
+        // The script exited. Anything still holding its pipes is a descendant
+        // it left behind; give them a moment, then kill the group so they
+        // cannot outlive the request.
+        let grace = min(deadline, Date().addingTimeInterval(Self.orphanGrace))
+        let outDone = stdout.wait(until: grace)
+        let errDone = stderr.wait(until: grace)
+        if !(outDone && errDone) {
+            killGroup()
+            _ = stdout.wait(until: Date().addingTimeInterval(Self.killGrace))
+            _ = stderr.wait(until: Date().addingTimeInterval(Self.killGrace))
+        }
+        return .finished
+    }
+
+    /// SIGTERM to the whole process group, then SIGKILL, then reap the leader.
+    /// Never blocks on a pipe: the drains are left to finish on their own.
+    private func killGroup() {
+        kill(-pid, SIGTERM)
+        let stop = Date().addingTimeInterval(Self.killGrace)
+        while !reap(block: false) && Date() < stop { usleep(10_000) }
+        kill(-pid, SIGKILL)
+        _ = reap(block: true)
+    }
+}
+
 /// Runs one of ReMynd's bash tools (the CLI, or the frame extractor) and
 /// returns its stdout. Same pipe discipline for both — see the comments.
 func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: Bool) {
     let label = (script as NSString).lastPathComponent
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = [script] + args
 
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
@@ -78,7 +243,6 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     if env["LC_ALL"] == nil && env["LANG"] == nil {
         env["LANG"] = "en_US.UTF-8"
     }
-    p.environment = env
 
     // Separate pipes, deliberately.
     //
@@ -91,37 +255,25 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     //
     // Diagnostics are not data. Keep them apart, and never let one destroy the
     // other.
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    p.standardOutput = outPipe
-    p.standardError = errPipe
-
-    do { try p.run() } catch {
-        return ("Could not run the ReMynd CLI: \(error.localizedDescription)", false)
+    let child: SpawnedChild
+    do {
+        child = try SpawnedChild(argv: ["/bin/bash", script] + args, env: env)
+    } catch {
+        return ("Could not run the ReMynd CLI: \(error)", false)
     }
 
-    // Read before waiting: a pipe that fills up deadlocks a process that is
-    // still writing to it. With two pipes that applies to BOTH — draining
-    // stdout while stderr fills would deadlock just as surely, so stderr is
-    // drained on its own thread.
-    var errData = Data()
-    let errLock = NSLock()
-    let drain = Thread {
-        let d = errPipe.fileHandleForReading.readDataToEndOfFile()
-        errLock.lock(); errData = d; errLock.unlock()
-    }
-    drain.start()
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-
-    // Enforce the timeout. It used to be an unused parameter, which meant a
-    // wedged query could hang the client forever with no way to tell why.
+    // The deadline starts at launch and covers the reads. It used to start
+    // after stdout reached EOF, so a hung script — or a grandchild holding
+    // stdout open — blocked here forever, and because requests are handled
+    // one at a time, so did every request after it.
     let deadline = Date().addingTimeInterval(timeout)
-    while p.isRunning && Date() < deadline { usleep(20_000) }
-    if p.isRunning {
-        p.terminate()
+    let outcome = child.wait(until: deadline)
+    if outcome == .timedOut {
         return ("The ReMynd query timed out after \(Int(timeout))s. Try a narrower time range.", false)
     }
-    p.waitUntilExit()
+    let data = child.stdout.snapshot()
+    let errData = child.stderr.snapshot()
+    let status = child.exitStatus
 
     // Lossy on purpose. String(data:encoding:) returns nil for the WHOLE
     // buffer if a single byte is malformed — one bad byte anywhere and the
@@ -129,20 +281,19 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     // malformed bytes are a matter of when, not if. Decoding lossily replaces
     // the bad byte with U+FFFD and keeps the other 1,700.
     let text = String(decoding: data, as: UTF8.self)
-    for _ in 0..<50 where drain.isExecuting { usleep(10_000) }
-    errLock.lock(); let errText = String(decoding: errData, as: UTF8.self); errLock.unlock()
+    let errText = String(decoding: errData, as: UTF8.self)
 
     // Never report emptiness as if it were an answer. An empty result with a
     // zero exit is a real "nothing found"; anything else is a fault, and the
     // model needs to see which so it can react instead of guessing.
     let complaint = errText.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        if p.terminationStatus != 0 {
+        if status != 0 {
             // Name the tool that failed and pass on what it said. A bare "the
             // CLI failed (exit 69)" hid an unaccepted Xcode license: the frame
             // script's /usr/bin/python3 is an Xcode shim, and the reason was on
             // stderr the whole time.
-            return ("\(label) failed (exit \(p.terminationStatus)) and produced no output"
+            return ("\(label) failed (exit \(status)) and produced no output"
                     + (complaint.isEmpty ? ". " : ": " + String(complaint.prefix(4000)) + " ")
                     + "Command: \(label) \(args.joined(separator: " "))", false)
         }
@@ -156,7 +307,7 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
         return ("No results for: \(label) \(args.joined(separator: " ")). "
                 + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)
     }
-    return (text, p.terminationStatus == 0)
+    return (text, status == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1490,11 @@ func toolListPayload() -> [[String: Any]] {
         if !visibility.contains("model") && !clientSupportsUI { return nil }
         var d: [String: Any] = ["name": t.name, "description": t.description, "inputSchema": t.schema]
         if let m = t.meta { d["_meta"] = m }
+        // Every tool only reads what is already on this Mac. Clients use the
+        // hints to decide what needs the user's approval (Codex asks before any
+        // tool it cannot tell is read-only). Only the two that say something:
+        // destructiveHint and idempotentHint are ignored for read-only tools.
+        d["annotations"] = ["readOnlyHint": true, "openWorldHint": false]
         return d
     }
 }
