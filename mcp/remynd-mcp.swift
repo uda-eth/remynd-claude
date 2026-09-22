@@ -59,13 +59,178 @@ func runCLI(_ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: B
     return runScript(cli, args, timeout: timeout)
 }
 
+// ---------------------------------------------------------------------------
+// Child processes
+//
+// Foundation's Process can neither put the child in its own process group nor
+// give it a stdin other than ours, and both matter here. The scripts start
+// grandchildren (sqlite3, awk, the frame extractor) that inherit stdout, so
+// killing bash alone leaves the pipe open; a process group can be killed
+// whole. And our stdin is the JSON-RPC stream: a script that read from it
+// would swallow the client's next request. So: posix_spawn, stdin from
+// /dev/null, every other descriptor closed in the child.
+// ---------------------------------------------------------------------------
+
+/// Collects one pipe on its own thread. Draining both pipes concurrently
+/// matters: a child blocked writing to a full stderr never finishes stdout.
+final class PipeDrain {
+    private let lock = NSLock()
+    private var data = Data()
+    private let done = DispatchSemaphore(value: 0)
+    private var finished = false
+
+    init(fd: Int32) {
+        let t = Thread { [self] in
+            var buf = [UInt8](repeating: 0, count: 65536)
+            while true {
+                let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                if n > 0 {
+                    lock.lock(); data.append(buf, count: n); lock.unlock()
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+            // The thread owns the descriptor: closing it anywhere else could
+            // race a read still in progress and hit a reused descriptor.
+            close(fd)
+            lock.lock(); finished = true; lock.unlock()
+            done.signal()
+        }
+        t.start()
+    }
+
+    /// Waits for EOF until `deadline`. True when the pipe closed.
+    func wait(until deadline: Date) -> Bool {
+        lock.lock(); let f = finished; lock.unlock()
+        if f { return true }
+        let remaining = max(0, deadline.timeIntervalSinceNow)
+        guard done.wait(timeout: .now() + remaining) == .success else { return false }
+        done.signal()   // leave it signalled for any later wait
+        return true
+    }
+
+    func snapshot() -> Data {
+        lock.lock(); defer { lock.unlock() }
+        return data
+    }
+}
+
+enum SpawnError: Error, CustomStringConvertible {
+    case pipe(Int32), spawn(Int32)
+    var description: String {
+        switch self {
+        case .pipe(let e): return "pipe: \(String(cString: strerror(e)))"
+        case .spawn(let e): return "posix_spawn: \(String(cString: strerror(e)))"
+        }
+    }
+}
+
+final class SpawnedChild {
+    enum Outcome { case finished, timedOut }
+
+    let pid: pid_t
+    let stdout: PipeDrain
+    let stderr: PipeDrain
+    private var reaped = false
+    private var rawStatus: Int32 = 0
+
+    /// How long a finished script's stray descendants may keep its stdout open
+    /// before they are killed. The script's own output is complete by then.
+    static let orphanGrace: TimeInterval = 2
+    /// Time between SIGTERM and SIGKILL for the process group.
+    static let killGrace: TimeInterval = 0.5
+
+    init(argv: [String], env: [String: String]) throws {
+        var outFDs: [Int32] = [-1, -1], errFDs: [Int32] = [-1, -1]
+        guard pipe(&outFDs) == 0 else { throw SpawnError.pipe(errno) }
+        guard pipe(&errFDs) == 0 else {
+            let e = errno; close(outFDs[0]); close(outFDs[1]); throw SpawnError.pipe(e)
+        }
+
+        var actions: posix_spawn_file_actions_t? = nil
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_adddup2(&actions, outFDs[1], 1)
+        posix_spawn_file_actions_adddup2(&actions, errFDs[1], 2)
+
+        var attr: posix_spawnattr_t? = nil
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        // Own process group (so the whole tree can be killed), and close every
+        // descriptor the file actions did not set up.
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
+        posix_spawnattr_setpgroup(&attr, 0)
+
+        let cArgs = argv.map { strdup($0) } + [nil]
+        let cEnv = env.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { cArgs.forEach { free($0) }; cEnv.forEach { free($0) } }
+
+        var pid: pid_t = 0
+        let rc = posix_spawn(&pid, argv[0], &actions, &attr, cArgs, cEnv)
+        // Our copies of the write ends must close, or EOF never arrives.
+        close(outFDs[1]); close(errFDs[1])
+        guard rc == 0 else {
+            close(outFDs[0]); close(errFDs[0])
+            throw SpawnError.spawn(rc)
+        }
+        self.pid = pid
+        self.stdout = PipeDrain(fd: outFDs[0])
+        self.stderr = PipeDrain(fd: errFDs[0])
+    }
+
+    /// Exit code, or 128 + signal for a child that was killed.
+    var exitStatus: Int32 {
+        let sig = rawStatus & 0x7f
+        return sig == 0 ? (rawStatus >> 8) & 0xff : 128 + sig
+    }
+
+    private func reap(block: Bool) -> Bool {
+        if reaped { return true }
+        var st: Int32 = 0
+        var r: pid_t
+        repeat { r = waitpid(pid, &st, block ? 0 : WNOHANG) } while r < 0 && errno == EINTR
+        if r == pid { rawStatus = st; reaped = true }
+        return reaped
+    }
+
+    /// Waits for the script to exit and both pipes to close, all by `deadline`.
+    func wait(until deadline: Date) -> Outcome {
+        while !reap(block: false) {
+            if Date() >= deadline { killGroup(); return .timedOut }
+            usleep(10_000)
+        }
+        // The script exited. Anything still holding its pipes is a descendant
+        // it left behind; give them a moment, then kill the group so they
+        // cannot outlive the request.
+        let grace = min(deadline, Date().addingTimeInterval(Self.orphanGrace))
+        let outDone = stdout.wait(until: grace)
+        let errDone = stderr.wait(until: grace)
+        if !(outDone && errDone) {
+            killGroup()
+            _ = stdout.wait(until: Date().addingTimeInterval(Self.killGrace))
+            _ = stderr.wait(until: Date().addingTimeInterval(Self.killGrace))
+        }
+        return .finished
+    }
+
+    /// SIGTERM to the whole process group, then SIGKILL, then reap the leader.
+    /// Never blocks on a pipe: the drains are left to finish on their own.
+    private func killGroup() {
+        kill(-pid, SIGTERM)
+        let stop = Date().addingTimeInterval(Self.killGrace)
+        while !reap(block: false) && Date() < stop { usleep(10_000) }
+        kill(-pid, SIGKILL)
+        _ = reap(block: true)
+    }
+}
+
 /// Runs one of ReMynd's bash tools (the CLI, or the frame extractor) and
 /// returns its stdout. Same pipe discipline for both — see the comments.
 func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -> (out: String, ok: Bool) {
     let label = (script as NSString).lastPathComponent
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = [script] + args
 
     var env = ProcessInfo.processInfo.environment
     env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
@@ -78,7 +243,6 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     if env["LC_ALL"] == nil && env["LANG"] == nil {
         env["LANG"] = "en_US.UTF-8"
     }
-    p.environment = env
 
     // Separate pipes, deliberately.
     //
@@ -91,37 +255,25 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     //
     // Diagnostics are not data. Keep them apart, and never let one destroy the
     // other.
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    p.standardOutput = outPipe
-    p.standardError = errPipe
-
-    do { try p.run() } catch {
-        return ("Could not run the ReMynd CLI: \(error.localizedDescription)", false)
+    let child: SpawnedChild
+    do {
+        child = try SpawnedChild(argv: ["/bin/bash", script] + args, env: env)
+    } catch {
+        return ("Could not run the ReMynd CLI: \(error)", false)
     }
 
-    // Read before waiting: a pipe that fills up deadlocks a process that is
-    // still writing to it. With two pipes that applies to BOTH — draining
-    // stdout while stderr fills would deadlock just as surely, so stderr is
-    // drained on its own thread.
-    var errData = Data()
-    let errLock = NSLock()
-    let drain = Thread {
-        let d = errPipe.fileHandleForReading.readDataToEndOfFile()
-        errLock.lock(); errData = d; errLock.unlock()
-    }
-    drain.start()
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-
-    // Enforce the timeout. It used to be an unused parameter, which meant a
-    // wedged query could hang the client forever with no way to tell why.
+    // The deadline starts at launch and covers the reads. It used to start
+    // after stdout reached EOF, so a hung script — or a grandchild holding
+    // stdout open — blocked here forever, and because requests are handled
+    // one at a time, so did every request after it.
     let deadline = Date().addingTimeInterval(timeout)
-    while p.isRunning && Date() < deadline { usleep(20_000) }
-    if p.isRunning {
-        p.terminate()
+    let outcome = child.wait(until: deadline)
+    if outcome == .timedOut {
         return ("The ReMynd query timed out after \(Int(timeout))s. Try a narrower time range.", false)
     }
-    p.waitUntilExit()
+    let data = child.stdout.snapshot()
+    let errData = child.stderr.snapshot()
+    let status = child.exitStatus
 
     // Lossy on purpose. String(data:encoding:) returns nil for the WHOLE
     // buffer if a single byte is malformed — one bad byte anywhere and the
@@ -129,20 +281,19 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
     // malformed bytes are a matter of when, not if. Decoding lossily replaces
     // the bad byte with U+FFFD and keeps the other 1,700.
     let text = String(decoding: data, as: UTF8.self)
-    for _ in 0..<50 where drain.isExecuting { usleep(10_000) }
-    errLock.lock(); let errText = String(decoding: errData, as: UTF8.self); errLock.unlock()
+    let errText = String(decoding: errData, as: UTF8.self)
 
     // Never report emptiness as if it were an answer. An empty result with a
     // zero exit is a real "nothing found"; anything else is a fault, and the
     // model needs to see which so it can react instead of guessing.
     let complaint = errText.trimmingCharacters(in: .whitespacesAndNewlines)
     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        if p.terminationStatus != 0 {
+        if status != 0 {
             // Name the tool that failed and pass on what it said. A bare "the
             // CLI failed (exit 69)" hid an unaccepted Xcode license: the frame
             // script's /usr/bin/python3 is an Xcode shim, and the reason was on
             // stderr the whole time.
-            return ("\(label) failed (exit \(p.terminationStatus)) and produced no output"
+            return ("\(label) failed (exit \(status)) and produced no output"
                     + (complaint.isEmpty ? ". " : ": " + String(complaint.prefix(4000)) + " ")
                     + "Command: \(label) \(args.joined(separator: " "))", false)
         }
@@ -156,7 +307,7 @@ func runScript(_ script: String, _ args: [String], timeout: TimeInterval = 30) -
         return ("No results for: \(label) \(args.joined(separator: " ")). "
                 + "The query ran cleanly and matched nothing — check sync_status for what is recorded.", true)
     }
-    return (text, p.terminationStatus == 0)
+    return (text, status == 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,23 +1232,14 @@ let tools: [Tool] = [
 
     Tool(name: "search_screen_history",
          description: """
-         Full-text search everything the user has seen on their screen — every app, page, document \
-         and message, as read by OCR. Use this whenever the user refers to something they personally \
-         saw, read, or did but cannot fully remember ("that article about X", "the error I hit last \
-         week", "what was that tool called").
-
-         Returns timestamped matches, most recent first. IMPORTANT: a timestamp records when the \
-         text was ON SCREEN, not when the underlying event happened — an emailed reminder about a \
-         meeting is stamped when it was read. Treat a match as a cursor: take a promising timestamp \
-         and call screen_text_in_range around it to read what was actually there, or show_moment to \
-         reveal the screen itself. If a search returns nothing, try fewer or different words before \
-         concluding it never happened. Words said out loud on calls are not in this index — search \
-         those with search_calls.
+         Full-text search of everything the user has seen on screen, as read by OCR. Use it whenever they refer to something they saw, read or did but cannot fully remember.
+         
+         A timestamp records when text was ON SCREEN, not when the event happened. Treat a hit as a cursor: read around it with screen_text_in_range. Words said out loud are not in this index — use search_calls.
          """,
          schema: ["type": "object",
                   "properties": [
-                     "query": ["type": "string", "description": "Words to search for. Multiple words are ANDed."],
-                     "limit": ["type": "integer", "description": "Max matches to return. Default 40."]
+                     "query": ["type": "string", "description": "Words to find; multiple are ANDed."],
+                     "limit": ["type": "integer", "description": "Max matches. Default 40."]
                   ],
                   "required": ["query"]],
          run: { a in
@@ -1109,17 +1251,9 @@ let tools: [Tool] = [
 
     Tool(name: "reconstruct_day",
          description: """
-         Rebuild a specific day from the user's screen history: what they worked on, ranked by time \
-         actually spent, each with the hours it spanned, plus an hour-by-hour trail.
-
-         Use for "what did I do on Tuesday", "what was I working on last Friday", or to summarise a \
-         day. The date is the user's LOCAL date. Each activity comes with a time span — use it: to \
-         say what actually happened inside an activity rather than just how long it lasted, call \
-         screen_text_in_range over that span and read it. A day with no recording says so plainly; \
-         that means the Mac was off, asleep or not recording, not that the user did nothing. When your \
-         answer describes particular moments from the day, show the headline ones with show_moment in \
-         the same turn. Calls recorded that day are listed first with their ids: what was said on \
-         them is in call_transcript, not in the screen history.
+         What the user worked on during one local day, ranked by time actually spent, each with its span, plus an hour-by-hour trail. Use for "what did I do on Tuesday".
+         
+         Read what happened inside an activity with screen_text_in_range over its span. Calls recorded that day are listed first with their ids; what was said on them is in call_transcript.
          """,
          schema: ["type": "object",
                   "properties": ["date": ["type": "string", "description": "Local date, YYYY-MM-DD."]],
@@ -1148,15 +1282,10 @@ let tools: [Tool] = [
 
     Tool(name: "recent_activity",
          description: """
-         What the user has been doing recently: the app and window they are in right now, what they \
-         have worked on over the last couple of hours ranked by time, and the verbatim text that was \
-         on screen in the last few minutes.
-
-         Use to orient yourself at the start of a conversation, or for "what am I working on", \
-         "what was I just reading", "where did I leave off".
+         What the user is doing right now and has done in the last couple of hours: current app and window, recent work ranked by time, and the verbatim text just on screen. Use to orient at the start of a conversation, or for "where did I leave off".
          """,
          schema: ["type": "object",
-                  "properties": ["minutes": ["type": "integer", "description": "How far back to read verbatim screen text. Default 30."]]],
+                  "properties": ["minutes": ["type": "integer", "description": "Minutes back. Default 30."]]],
          run: { a in
              var args = ["recent"]
              if let m = int(a, "minutes") { args.append(String(m)) }
@@ -1165,25 +1294,14 @@ let tools: [Tool] = [
 
     Tool(name: "screen_text_in_range",
          description: """
-         The verbatim text that was on the user's screen between two times — the substance behind an \
-         activity. This is how you answer "what did I actually do in Gmail" rather than "you were in \
-         Gmail for 82 minutes".
-
-         Pair it with search_screen_history (which gives you a timestamp) or reconstruct_day (which \
-         gives you an activity's span). Times are the user's LOCAL time.
-
-         Keep the range tight — an hour reads well, a whole day does not and will be truncated.          Narrow first with search_screen_history or reconstruct_day's activity spans.
-
-         The text is OCR, so it arrives as fragments with interface chrome mixed in and occasional \
-         garbled words. Read across it and report what it means; do not quote it raw at the user. \
-         Digits are the weak point — treat numbers read off the screen as leads, not facts. Where a \
-         name or subject is too mangled to be sure of, leave it out rather than guess. When what you \
-         read here is the moment your answer is about, show it with show_moment in the same turn.
+         The verbatim text on the user's screen between two LOCAL times — the substance behind an activity, not just its duration.
+         
+         Narrow first with search_screen_history or a reconstruct_day span; an hour reads well, a whole day is truncated. The text is OCR: fragments and garbled words, digits least reliable. Report what it means rather than quoting it raw, and leave out anything too mangled to be sure of.
          """,
          schema: ["type": "object",
                   "properties": [
-                     "from": ["type": "string", "description": "Local start time, e.g. \"2026-08-18 14:00\"."],
-                     "to": ["type": "string", "description": "Local end time. Optional; defaults to now."]
+                     "from": ["type": "string", "description": "Local start, \"YYYY-MM-DD HH:MM\"."],
+                     "to": ["type": "string", "description": "Local end. Defaults to now."]
                   ],
                   "required": ["from"]],
          run: { a in
@@ -1197,12 +1315,9 @@ let tools: [Tool] = [
 
     Tool(name: "time_by_activity",
          description: """
-         Where the user's time actually went over the last N days, by application. Use for "how much \
-         time did I spend in Slack this month", "what am I spending my days on".
-
-         Counts backwards from today only — it takes `days`, not a date range. For a specific day, \
-         use reconstruct_day, which also ranks by what was being DONE rather than which app was \
-         focused, because the window title carries the subject.
+         How much of the user's time went to each application over the last N days. The only tool that measures duration — screen text cannot.
+         
+         Counts back from today and takes `days`, not a date range. For one specific day use reconstruct_day, which ranks by what was being done rather than which app was focused.
          """,
          schema: ["type": "object",
                   "properties": ["days": ["type": "integer", "description": "How many days back. Default 7."]]],
@@ -1222,11 +1337,9 @@ let tools: [Tool] = [
 
     Tool(name: "search",
          description: """
-         Search everything the user has seen on their screen. Returns the moments that matched — one \
-         per app window, most recent first — each with an id, what the window was, and a snippet. \
-         Call `fetch` with an id to read what was actually on screen at that moment.
-
-         A timestamp records when the text was ON SCREEN, not when the underlying event happened.
+         Search everything the user has seen on screen. Returns matching moments, one per app window, each with an id, the window, and a snippet. Call `fetch` with an id to read that moment.
+         
+         A timestamp records when the text was ON SCREEN, not when the event happened.
          """,
          schema: ["type": "object",
                   "properties": ["query": ["type": "string", "description": "What to look for."]],
@@ -1244,12 +1357,7 @@ let tools: [Tool] = [
 
     Tool(name: "fetch",
          description: """
-         Read what was on the user's screen at one moment, given an id from `search`. Returns the \
-         verbatim text captured around that moment, and which app and window it was.
-
-         The text is OCR: fragments, interface chrome, occasional garbled words. Read across it and \
-         report what it means rather than quoting it raw. Digits are the weak point — treat numbers \
-         read off a screen as leads, not facts.
+         Read what was on the user's screen at one moment, given an id from `search`. Returns the verbatim text around that moment and which app and window it was. OCR, so digits are the weak point — treat numbers read off a screen as leads, not facts.
          """,
          schema: ["type": "object",
                   "properties": ["id": ["type": "string", "description": "An id returned by `search`."]],
@@ -1269,54 +1377,36 @@ let tools: [Tool] = [
 
     Tool(name: "list_calls",
          description: """
-         Calls and meetings ReMynd recorded — Zoom, Google Meet, Teams and the like — with the audio \
-         transcribed on the Mac: date, time, length, app, title, participants, how many transcript \
-         lines and speakers, and the call id in brackets. The screen tools cannot hear, so this is \
-         where meetings and conversations live.
-
-         Use for "my calls this week", "the meeting with Ali on Friday", or to find the id for \
-         call_transcript. Pass `date` (local YYYY-MM-DD) for one day, or `days` to look back \
-         (default 14). "not transcribed" means the audio was kept but has no text.
+         Calls and meetings ReMynd recorded and transcribed on this Mac: date, time, length, app, title, participants, line and speaker counts, and the call id in brackets. The screen tools cannot hear, so this is where meetings live.
          """,
          schema: ["type": "object",
                   "properties": [
-                     "date": ["type": "string", "description": "Optional. One local day, YYYY-MM-DD."],
-                     "days": ["type": "integer", "description": "Optional. How many days back to list. Default 14."]
+                     "date": ["type": "string", "description": "One local day, YYYY-MM-DD."],
+                     "days": ["type": "integer", "description": "Days back. Default 14."]
                   ]],
          run: listCallsText),
 
     Tool(name: "call_transcript",
          description: """
-         What was actually said on a call: the diarized transcript, one timestamped line per \
-         utterance with its speaker. Use it for "what did Ali say about pricing", "what did we agree \
-         with Julian", a meeting recap, or anything said out loud.
-
-         Pass `call` as the id from list_calls or search_calls (most reliable), "last" for the most \
-         recent call, or a fragment of the title or a participant's name. A long call comes in \
-         pages: follow the `offset` the result gives, or read just part of it with `from` and `to` \
-         (local clock times within the call). Speaker labels are about 85% reliable and names are \
-         often misheard — check a quote against the surrounding lines before putting a name on it. \
-         To show what was on screen while something was said, call show_moment at that time.
+         What was said on a call: the diarized transcript, one timestamped line per utterance with its speaker. Use for "what did X say about Y", a recap, or anything said out loud.
+         
+         `call` takes an id from list_calls or search_calls, "last", or a title or participant fragment. Speaker labels are about 85% reliable and names are often misheard, so check a quote against the lines around it before attributing it.
          """,
          schema: ["type": "object",
                   "properties": [
-                     "call": ["type": "string", "description": "Call id (from list_calls/search_calls), \"last\", or a title/participant fragment."],
-                     "from": ["type": "string", "description": "Optional. Local time within the call to start at, e.g. \"10:24\"."],
+                     "call": ["type": "string", "description": "Call id, \"last\", or a title/participant fragment."],
+                     "from": ["type": "string", "description": "Optional. Start time within the call, e.g. \"10:24\"."],
                      "to": ["type": "string", "description": "Optional. Local time within the call to stop at."],
-                     "offset": ["type": "integer", "description": "Optional. Transcript line to start from, as given by the previous page."]
+                     "offset": ["type": "integer", "description": "Optional. Line to start from (from the previous page)."]
                   ],
                   "required": ["call"]],
          run: callTranscriptText),
 
     Tool(name: "search_calls",
          description: """
-         Full-text search across every call transcript — words people said out loud, as opposed to \
-         what was on screen. Returns matching lines newest first with the time, speaker, call title \
-         and call id; open the conversation around a hit with call_transcript (that call id, `from` a \
-         minute or two before the hit).
-
-         Words are ANDed; put a phrase in double quotes. Transcription mishears names and jargon, so \
-         try a simpler word or another spelling before concluding it was never said.
+         Full-text search across every call transcript — words people said out loud, as opposed to what was on screen. Returns matching lines newest first with the time, speaker, call title and id.
+         
+         It returns at most 100 lines, newest first, and takes no date range: to reach a specific day, use list_calls for that date and then call_transcript. Open the conversation around a hit with call_transcript, `from` a minute or two before it.
          """,
          schema: ["type": "object",
                   "properties": [
@@ -1328,38 +1418,24 @@ let tools: [Tool] = [
 
     Tool(name: "show_moment",
          description: """
-         Reveal an exact moment from the user's screen as the real frames — the actual pixels that \
-         were on their screen at that second, returned as images you and the user both see. Text \
-         tells them what was there; this shows them.
-
-         Call it on your own, in the same turn, whenever your answer rests on particular moments: the \
-         most important thing they did, a call or meeting, something they saw or read, a message, a \
-         design, a decision, an error, or screen text too garbled to trust. A recap of a day or a week \
-         still gets frames of its one to three headline moments. Locate each moment with \
-         search_screen_history, reconstruct_day or screen_text_in_range, then pass its local timestamp \
-         as `at` — or pass up to three at once as `moments`, each with a short `label` saying what it \
-         shows. Don't ask first and don't offer frames at the end of your answer; show them. Skip it \
-         only for pure numbers (time per app, counts) or when nothing specific was found.
-
-         Frames come from a ±window around `at` (default 30 seconds, 2 frames). Pass `app` to keep to \
-         the application in question when several were on screen. Nothing is written to the user's \
-         history; apps the user excluded from agent access are never shown. Recordings older than \
-         the current hour are encrypted and need the ReMynd app to be running. A frame is the raw \
-         screen: unlike text results, secrets visible in it are not redacted, so don't read \
-         passwords or keys out of a frame back to the user.
+         Reveal a moment from the user's screen as the real frames — the actual pixels, returned as images you and the user both see.
+         
+         Costly, so spend it where it counts: the one or two headline moments an answer is really about, shown in the same turn without asking first. Do NOT call it to check a fact or to confirm what something said — the screen text already came back from the search tools. Skip it for pure numbers, and for recaps beyond their single headline moment.
+         
+         Locate the moment first, then pass its local timestamp as `at`, or up to three as `moments` with a short `label` each. Frames come from a ±window around `at` (default 30s, 2 frames); `app` keeps to one application. Recordings older than the current hour need the ReMynd app running, and some segments cannot be decrypted — a failure here is not an answer, so say what the text shows instead. A frame is the raw screen and is not redacted: never read a password or key out of one.
          """,
          schema: ["type": "object",
                   "properties": [
-                     "at": ["type": "string", "description": "Local time of the moment, \"YYYY-MM-DD HH:MM:SS\" (a bare HH:MM is accepted). Take it from a search or day result."],
-                     "app": ["type": "string", "description": "Optional. Only frames while this app was frontmost (substring match, e.g. \"Chrome\", \"Slack\")."],
-                     "window_seconds": ["type": "integer", "description": "Optional. Seconds either side of `at` to look in. Default 30, max 600."],
-                     "max_frames": ["type": "integer", "description": "Optional. How many frames to return, 1–4. Default 2 for `at`, 1 per moment for `moments`."],
+                     "at": ["type": "string", "description": "Local \"YYYY-MM-DD HH:MM:SS\"; bare HH:MM accepted."],
+                     "app": ["type": "string", "description": "Only frames while this app was frontmost (substring)."],
+                     "window_seconds": ["type": "integer", "description": "Seconds either side of `at`. Default 30, max 600."],
+                     "max_frames": ["type": "integer", "description": "Frames to return, 1–4. Default 2."],
                      "moments": ["type": "array", "maxItems": 3,
-                                 "description": "Optional. Up to three moments to show in one call, instead of `at`.",
+                                 "description": "Up to three moments instead of `at`.",
                                  "items": ["type": "object",
                                            "properties": [
                                               "at": ["type": "string", "description": "Local time, \"YYYY-MM-DD HH:MM:SS\"."],
-                                              "label": ["type": "string", "description": "Short caption, e.g. \"Boris demoing Storage settings to Julian\"."],
+                                              "label": ["type": "string", "description": "Short caption."],
                                               "app": ["type": "string", "description": "Optional app filter for this moment."]
                                            ],
                                            "required": ["at"]]]
@@ -1379,11 +1455,7 @@ let tools: [Tool] = [
 
     Tool(name: "sync_status",
          description: """
-         What ReMynd has recorded and how fresh it is: which profile is being read, how far back the \
-         history goes, when the last capture happened, and whether credential redaction is on.
-
-         Call this before telling the user that something is not in their history — it distinguishes \
-         "no record of that" from "not recorded during that period at all".
+         What ReMynd has recorded and how fresh it is: the profile being read, how far back history goes, the last capture, and whether credential redaction is on. Call it before telling the user something is not in their history — it separates "no record of that" from "not recording then".
          """,
          schema: ["type": "object", "properties": [:]],
          run: { _ in let r = runCLI(["status"]); return (r.out, r.ok) }),
@@ -1418,6 +1490,11 @@ func toolListPayload() -> [[String: Any]] {
         if !visibility.contains("model") && !clientSupportsUI { return nil }
         var d: [String: Any] = ["name": t.name, "description": t.description, "inputSchema": t.schema]
         if let m = t.meta { d["_meta"] = m }
+        // Every tool only reads what is already on this Mac. Clients use the
+        // hints to decide what needs the user's approval (Codex asks before any
+        // tool it cannot tell is read-only). Only the two that say something:
+        // destructiveHint and idempotentHint are ignored for read-only tools.
+        d["annotations"] = ["readOnlyHint": true, "openWorldHint": false]
         return d
     }
 }
