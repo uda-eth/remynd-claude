@@ -31,6 +31,15 @@ _here="$(cd "$(dirname "$_self")" && pwd)"
 
 die() { printf 'remynd: %s\n' "$*" >&2; exit 1; }
 
+require_positive_integer() {
+  local value="$1" label="$2" maximum="$3"
+  case "$value" in
+    ''|*[!0-9]*) die "$label must be a positive whole number, got \"$value\"" ;;
+  esac
+  [ "$value" -gt 0 ] || die "$label must be greater than zero"
+  [ "$value" -le "$maximum" ] || die "$label must be at most $maximum"
+}
+
 _profile() {
   local p
   p="$(remynd_find_profile)" || die "no ReMynd recordings found on this Mac.
@@ -76,6 +85,7 @@ cmd_now() {
 
 cmd_recent() {
   local mins="${1:-30}" db redact
+  require_positive_integer "$mins" "minutes" 10080
   db="$(remynd_db_path "$(_profile)")"
   redact="$(remynd_config_get redact_credentials 1)"
   remynd_digest_full "$db" "$mins" "$(remynd_config_get session_budget_tokens 8000)" "$redact"
@@ -85,6 +95,7 @@ cmd_recent() {
 cmd_search() {
   [ $# -ge 1 ] || die "usage: remynd search <query> [limit]"
   local q="$1" limit="${2:-40}" db redact
+  require_positive_integer "$limit" "limit" 1000
   db="$(remynd_db_path "$(_profile)")"
   redact="$(remynd_config_get redact_credentials 1)"
 
@@ -248,6 +259,7 @@ EOS
 
 cmd_apps() {
   local days="${1:-7}" db since
+  require_positive_integer "$days" "days" 3650
   db="$(remynd_db_path "$(_profile)")"
   since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S')"
   local lo; lo="$since"
@@ -415,6 +427,7 @@ cmd_moments() {
 cmd_moment() {
   [ $# -ge 1 ] || die "usage: remynd moment <YYYY-MM-DD HH:MM:SS> [minutes]"
   local ts="$1" span="${2:-4}" db ts_utc
+  require_positive_integer "$span" "minutes" 120
   db="$(remynd_db_path "$(_profile)")"
   ts_utc="$(remynd_local_to_utc "$ts")" || die "bad timestamp: $ts"
 
@@ -449,26 +462,24 @@ cmd_moment() {
 # and the audio are both sitting on disk. That is the whole reason these
 # commands exist.
 #
-# Calls are also the worst case for the split-profile problem cmd_day warns
-# about: they are few, they are long, and each one lands in whichever profile
-# held the recorder that hour. Worse, when two builds run at once BOTH
-# transcribe the same meeting, and they do it unevenly — one copy came back
-# with speaker labels, a title and a participant list, the other with 437
-# anonymous lines. So these commands read EVERY profile and merge, ignoring
-# the pinned one, and when two rows describe one meeting they keep the copy
-# that actually knows who was talking.
+# These commands read the SELECTED profile only, like every other command here
+# and like the CLI bundled in the ReMynd app. They used to read every profile and
+# merge, so "the last call" could come from a development build while the app
+# answered from production, and two different meetings in one app within five
+# minutes were taken for one recording of the same meeting and collapsed. A call
+# that landed in another profile is reached with REMYND_PROFILE.
 # ---------------------------------------------------------------------------
 
 remynd_extras_db_path() { printf '%s/Recordings/Extras/extras.db\n' "$1"; }
 
 _remynd_extras_dbs() {
-  local e
-  for e in "$HOME/Library/Application Support/Move37/"*/Recordings/Extras/extras.db; do
-    [ -f "$e" ] && printf '%s\n' "$e"
-  done
+  local p e
+  p="$(remynd_find_profile)" || return 0
+  e="$(remynd_extras_db_path "$p")"
+  [ -f "$e" ] && printf '%s\n' "$e"
 }
 
-# Every call from every profile, deduped, newest first. Tab-separated:
+# Every call in the selected profile, newest first. Tab-separated:
 #   epoch  start_local  end_local  app  title  participants  lines  speakers  id  secs  extras_db
 _remynd_call_rows() {
   local since_utc="${1:-0001-01-01 00:00:00}" e
@@ -493,31 +504,7 @@ _remynd_call_rows() {
       'NF >= 10 && $1 != "" { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                                      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,db }'
   done < <(_remynd_extras_dbs) |
-  /usr/bin/sort -t"$(printf '\t')" -k1,1nr |
-  /usr/bin/awk -F'\t' -v OFS='\t' '
-    # Richness, in the order it matters to a reader: knowing WHO spoke beats
-    # knowing what the meeting was called, which beats the guest list. Line
-    # count only breaks ties, because a longer transcript of anonymous
-    # "?: ..." lines is not the better copy.
-    function score(spk, title, parts, lines) {
-      return (spk + 0 > 0 ? 4000000 : 0) + (title != "" ? 2000000 : 0) \
-           + (parts != "" ? 1000000 : 0) + (lines + 0)
-    }
-    {
-      s = score($8, $5, $6, $7)
-      for (i = 1; i <= n; i++) {
-        # One meeting, two recorders: the builds start their call timers
-        # seconds to a couple of minutes apart, so match on app plus a
-        # five-minute window rather than on an id neither shares.
-        split(keep[i], k, "\t")
-        if (k[4] == $4 && (k[1] - $1 < 300 && $1 - k[1] < 300)) {
-          if (s > kscore[i]) { keep[i] = $0; kscore[i] = s }
-          next
-        }
-      }
-      n++; keep[n] = $0; kscore[n] = s
-    }
-    END { for (i = 1; i <= n; i++) print keep[i] }'
+  /usr/bin/sort -t"$(printf '\t')" -k1,1nr
 }
 
 # "[\"Ann\",\"Bo\"]" -> "Ann, Bo". The column is a JSON array; nothing here
@@ -534,6 +521,7 @@ AWKF
 
 cmd_calls() {
   local days="${1:-14}" since
+  require_positive_integer "$days" "days" 3650
   since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || die "bad day count: $days"
 
   echo "# Calls recorded, last $days days"
@@ -654,15 +642,9 @@ cmd_call() {
 cmd_heard() {
   [ $# -ge 1 ] || die "usage: remynd heard <query> [limit]"
   local q="$1" limit="${2:-30}" esc redact e printed=0
+  require_positive_integer "$limit" "limit" 1000
   esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
   redact="$(remynd_config_get redact_credentials 1)"
-
-  # When two builds recorded the same meeting they also transcribed it twice,
-  # so an unfiltered search returns every hit twice in slightly different
-  # words — which reads as two separate calls saying nearly the same thing.
-  # Reuse the merge: keep hits only from the copy `remynd calls` settled on.
-  local keep_ids
-  keep_ids="$(_remynd_call_rows | /usr/bin/awk -F'\t' '{ printf "%s,", $9 }')"
 
   while IFS= read -r e; do
     [ -n "$e" ] || continue
@@ -681,11 +663,9 @@ cmd_heard() {
     /usr/bin/awk -F"$REMYND_FS" -v OFS='\t' 'NF >= 5 { print $1, $2, $3, $4, $5 }'
   done < <(_remynd_extras_dbs) |
   /usr/bin/sort -t"$(printf '\t')" -k1,1r |
-  /usr/bin/awk -F'\t' -v doredact="$redact" -v lim="$limit" -v keep="$keep_ids" '
+  /usr/bin/awk -F'\t' -v doredact="$redact" -v lim="$limit" '
 '"$(_remynd_redact_awk)"'
-    BEGIN { n_keep = split(keep, kk, ","); for (i = 1; i <= n_keep; i++) if (kk[i] != "") ok[kk[i]] = 1 }
-    { if (!($4 in ok)) next
-      key = $1 " " substr($5, 1, 60)
+    { key = $1 " " substr($5, 1, 60)
       if (key in seen) next
       seen[key] = 1
       if (n++ >= lim) exit

@@ -389,9 +389,29 @@ func str(_ args: [String: Any], _ key: String, aliases: [String] = []) -> String
     return nil
 }
 func int(_ args: [String: Any], _ key: String) -> Int? {
+    // A JSON boolean bridges to NSNumber, and `as? Int` would read true as 1.
+    if let n = args[key] as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
     if let i = args[key] as? Int { return i }
-    if let d = args[key] as? Double { return Int(d) }
+    // Int(Double) traps on a value outside Int's range, and a model can send
+    // 1e30: that killed the whole server mid-conversation. Out of range reads
+    // as nil, and tools/call refuses it through invalidIntegerArgument.
+    if let d = args[key] as? Double { return Int(exactly: d.rounded(.towardZero)) }
     if let s = args[key] as? String { return Int(s) }
+    return nil
+}
+
+/// What is wrong with the first argument the tool's schema declares an integer
+/// but that cannot be read as one, or nil if there is nothing wrong. Falling back
+/// to the tool's default was silent: `limit: "abc"` answered with 40 rows, as if
+/// that were what was asked for. An explicit null means absent.
+func invalidIntegerArgument(_ tool: Tool, _ args: [String: Any]) -> String? {
+    guard let properties = tool.schema["properties"] as? [String: Any] else { return nil }
+    for key in properties.keys.sorted() {
+        guard (properties[key] as? [String: Any])?["type"] as? String == "integer",
+              let value = args[key], !(value is NSNull), int(args, key) == nil else { continue }
+        let shown = value is String ? "\"\(value)\"" : "\(value)"
+        return "`\(key)` must be a whole number, got \(shown.prefix(80)). Leave it out to use the default."
+    }
     return nil
 }
 
@@ -1581,6 +1601,12 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
             return errorResponse(id, -32602, "Unknown tool: \(params["name"] as? String ?? "?")")
         }
         let args = params["arguments"] as? [String: Any] ?? [:]
+
+        if let problem = invalidIntegerArgument(tool, args) {
+            logClientEvent("tools/call \(tool.name) images=0 isError=true")
+            return ["jsonrpc": "2.0", "id": id ?? NSNull(),
+                    "result": ["content": [["type": "text", "text": problem]], "isError": true]]
+        }
 
         // ChatGPT's `search`/`fetch` want structuredContent, and the same
         // object JSON-encoded in the text content for clients that only read
