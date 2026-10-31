@@ -1125,17 +1125,21 @@ func daysBack(toLocalDate s: String) -> Int? {
 }
 
 /// `remynd calls` output, one record per call: its line plus the indented lines under it.
-func callRecords(days: Int) -> (records: [String], ok: Bool, raw: String) {
+/// `scope` is which profile answered and what it left out, for an answer built from the records.
+func callRecords(days: Int) -> (records: [String], ok: Bool, raw: String, scope: String) {
     let r = runCLI(["calls", String(days)], timeout: 30)
     var recs: [String] = []
+    var scope: [String] = []
     for line in r.out.components(separatedBy: "\n") {
         if line.range(of: #"^  \d{4}-\d{2}-\d{2}  "#, options: .regularExpression) != nil {
             recs.append(line)
         } else if line.hasPrefix("      "), !recs.isEmpty {
             recs[recs.count - 1] += "\n" + line
+        } else if line.hasPrefix("From profile: ") || line.hasPrefix("Not read here: ") {
+            scope.append(line)
         }
     }
-    return (recs, r.ok, r.out)
+    return (recs, r.ok, r.out, scope.joined(separator: "\n"))
 }
 
 /// The CLI's own next-step hints name CLI commands; say the tool names instead.
@@ -1160,10 +1164,10 @@ func listCallsText(_ a: [String: Any]) -> (String, Bool) {
         let day = String(date.prefix(10))
         let hits = c.records.filter { $0.hasPrefix("  \(day)  ") }
         if hits.isEmpty {
-            return ("No calls were recorded on \(day). A meeting ReMynd did not hear can still show up in reconstruct_day as a Zoom or Meet window.", true)
+            return ("This profile has no calls on \(day). A meeting ReMynd did not hear can still show up in reconstruct_day as a Zoom or Meet window.\n\n" + c.scope, true)
         }
         return ("# Calls on \(day)\n\n" + hits.joined(separator: "\n")
-                + "\n\nRead what was said: call_transcript with call set to the id in brackets.", true)
+                + "\n\nRead what was said: call_transcript with call set to the id in brackets.\n\n" + c.scope, true)
     }
     let days = max(1, min(3650, int(a, "days") ?? 14))
     let c = callRecords(days: days)
@@ -1287,11 +1291,12 @@ let tools: [Tool] = [
              // that day's calls up front so a meeting is never read as silence.
              guard r.ok, let back = daysBack(toLocalDate: d) else { return (r.out, r.ok) }
              let day = String(d.prefix(10))
-             let calls = callRecords(days: back).records.filter { $0.hasPrefix("  \(day)  ") }
+             let c = callRecords(days: back)
+             let calls = c.records.filter { $0.hasPrefix("  \(day)  ") }
              guard !calls.isEmpty else { return (r.out, r.ok) }
              let section = "## Calls recorded that day — audio, transcribed\n\n"
                  + "The screen history below cannot hear. What was said on these calls is in call_transcript "
-                 + "(call: the id in brackets).\n\n" + calls.joined(separator: "\n")
+                 + "(call: the id in brackets).\n\n" + calls.joined(separator: "\n") + "\n\n" + c.scope
              var parts = r.out.components(separatedBy: "\n")
              if let head = parts.first, head.hasPrefix("# ") {
                  parts.removeFirst()

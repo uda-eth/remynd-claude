@@ -126,5 +126,115 @@ else
   has "mcp: limit 1e30 answers instead of crashing" "$out" "must be a whole number"
 fi
 
+# ---------------------------------------------------------------------------
+# Which profile answered. Calls read one profile, so nothing may claim to speak
+# for the whole Mac, and a stale pin is an error, not an empty history.
+# ---------------------------------------------------------------------------
+pin "$PROD"
+out="$(remynd calls 3650)"
+has "calls names its profile" "$out" "From profile: ReMynd-fixture (production)"
+has "calls points at the other profile" "$out" "ReMynd-dev-fixture (development), 1 call"
+has "calls says how to read it" "$out" "REMYND_PROFILE"
+out="$(remynd call last)"
+has "call last names its profile" "$out" "From profile: ReMynd-fixture (production)"
+out="$(remynd heard budget)"
+has "heard names its profile" "$out" "From profile: ReMynd-fixture (production)"
+has "heard says what it did not search" "$out" "ReMynd-dev-fixture (development), 1 call"
+out="$(remynd call 2)"
+has   "an id wins over newer calls whose date holds the digit" "$out" "# Prod review"
+hasnt "an id is not ambiguous" "$out" "pick one by id"
+pin "$DEV"
+out="$(remynd calls 3650)"
+has "pinned to dev: calls names dev" "$out" "From profile: ReMynd-dev-fixture (development)"
+has "pinned to dev: calls points at production" "$out" "ReMynd-fixture (production), 3 calls"
+
+# A call only in another profile is not "never recorded".
+profile ReMynd-empty "SELECT 1;"
+EMPTY="$BASE/ReMynd-empty"
+pin "$EMPTY"
+out="$(remynd call last)"; rc=$?
+is    "empty profile: call last exits 1" "$rc" 1
+hasnt "empty profile: call last does not speak for the Mac" "$out" "on this Mac"
+has   "empty profile: call last names the profile" "$out" "ReMynd-empty"
+has   "empty profile: call last points at a profile with calls" "$out" "ReMynd-dev-fixture (development), 1 call"
+has   "empty profile: call last says how" "$out" "REMYND_PROFILE"
+out="$(remynd call zzz)"; rc=$?
+is    "empty profile: a fragment exits 1" "$rc" 1
+has   "empty profile: a fragment points at a profile with calls" "$out" "ReMynd-fixture (production), 3 calls"
+out="$(remynd heard budget)"; rc=$?
+is    "empty profile: heard exits 0" "$rc" 0
+hasnt "empty profile: heard does not speak for every call" "$out" "any recorded call"
+has   "empty profile: heard names the profile" "$out" "ReMynd-empty"
+has   "empty profile: heard points at a profile with calls" "$out" "ReMynd-dev-fixture (development), 1 call"
+out="$(remynd calls 3650)"; rc=$?
+is    "empty profile: calls exits 0" "$rc" 0
+has   "empty profile: calls names the profile" "$out" "From profile: ReMynd-empty (production)"
+has   "empty profile: calls points at a profile with calls" "$out" "ReMynd-dev-fixture (development), 1 call"
+out="$(remynd status)"
+has   "status: calls line names the profile's scope" "$out" "Calls:       none recorded in this profile"
+has   "status: names the others" "$out" "ReMynd-dev-fixture (development), 1 call"
+
+# A backup holds copies, not another place to look.
+profile ReMynd-fixture-backup "INSERT INTO Call VALUES (9,'Zoom','$(ago 10d)','$(ago 10d)','Backed up','[]');"
+out="$(remynd calls 3650)"
+hasnt "a backup is not offered as a profile" "$out" "ReMynd-fixture-backup"
+
+# With nothing else on the Mac there is nothing to point at.
+SOLO="$(mktemp -d /tmp/remynd-solo.XXXXXX)"
+mkdir -p "$SOLO/Recordings/Extras"
+/usr/bin/sqlite3 "$SOLO/Recordings/app.db" "CREATE TABLE FocusedWindow (id INTEGER PRIMARY KEY);"
+out="$(env -i HOME="$SOLO" PATH=/usr/bin:/bin REMYND_STATE_DIR="$STATE" REMYND_PROFILE="$SOLO" bash "$CLI" calls 30 2>&1)"
+hasnt "no other profile: no pointer" "$out" "REMYND_PROFILE"
+has   "a profile with no extras.db still says where it looked" "$out" "From profile:"
+rm -rf "$SOLO"
+
+# A stale pin reads as an error from every command, naming the pin.
+GONE="$BASE/ReMynd-renamed-away"
+pin "$GONE"
+for argv in "calls 30" "call last" "call 2" "heard budget" "recent" "search x" "day 2026-09-14"; do
+  # shellcheck disable=SC2086
+  out="$(remynd $argv)"; rc=$?
+  is    "stale pin: $argv exits 1" "$rc" 1
+  has   "stale pin: $argv names the pin" "$out" "$GONE"
+  has   "stale pin: $argv says it is the pin" "$out" "pinned profile does not exist"
+  hasnt "stale pin: $argv does not read as no calls" "$out" "no calls"
+  hasnt "stale pin: $argv does not read as nothing said" "$out" "nothing matching"
+done
+out="$(remynd status)"
+has "stale pin: status says so" "$out" "pinned profile does not exist"
+: > "$STATE/config"
+out="$(env -i HOME="$H" PATH=/usr/bin:/bin REMYND_STATE_DIR="$STATE" REMYND_PROFILE="$GONE" bash "$CLI" calls 30 2>&1)"; rc=$?
+is  "stale REMYND_PROFILE: exits 1" "$rc" 1
+has "stale REMYND_PROFILE: names the variable" "$out" "REMYND_PROFILE"
+has "stale REMYND_PROFILE: names the path" "$out" "$GONE"
+
+if [ -x "$MCP" ]; then
+  pin "$PROD"
+  TEN_DAYS_AGO="$(/bin/date -v-10d '+%Y-%m-%d')"
+  out="$(mcp_call list_calls '{"days":3650}')"
+  has "mcp: list_calls names its profile" "$out" "From profile: ReMynd-fixture (production)"
+  has "mcp: list_calls points at the other profile" "$out" "ReMynd-dev-fixture (development), 1 call"
+  out="$(mcp_call list_calls "{\"date\":\"$TEN_DAYS_AGO\"}")"
+  has "mcp: list_calls with a date names its profile" "$out" "From profile: ReMynd-fixture (production)"
+  has "mcp: list_calls with a date points at the other profile" "$out" "ReMynd-dev-fixture (development), 1 call"
+  out="$(mcp_call list_calls '{"date":"2020-01-02"}')"
+  has   "mcp: a date with none names the profile" "$out" "From profile: ReMynd-fixture (production)"
+  has   "mcp: a date with none points at the other profile" "$out" "ReMynd-dev-fixture (development), 1 call"
+  hasnt "mcp: a date with none does not speak for the Mac" "$out" "No calls were recorded on"
+  out="$(mcp_call reconstruct_day "{\"date\":\"$TEN_DAYS_AGO\"}")"
+  has "mcp: reconstruct_day names its calls' profile" "$out" "From profile: ReMynd-fixture (production)"
+  out="$(mcp_call call_transcript '{"call":"2"}')"
+  has "mcp: call_transcript names its profile" "$out" "From profile: ReMynd-fixture (production)"
+  out="$(mcp_call search_calls '{"query":"budget"}')"
+  has "mcp: search_calls names its profile" "$out" "From profile: ReMynd-fixture (production)"
+  pin "$GONE"
+  for tool_args in 'list_calls {"days":30}' 'call_transcript {"call":"last"}' 'search_calls {"query":"budget"}'; do
+    out="$(mcp_call "${tool_args%% *}" "${tool_args#* }")"
+    has   "mcp: stale pin: ${tool_args} is an error" "$out" '"isError":true'
+    has   "mcp: stale pin: ${tool_args} names the pin" "$out" "pinned profile does not exist"
+  done
+  pin "$PROD"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
