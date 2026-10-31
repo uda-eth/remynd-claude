@@ -389,9 +389,29 @@ func str(_ args: [String: Any], _ key: String, aliases: [String] = []) -> String
     return nil
 }
 func int(_ args: [String: Any], _ key: String) -> Int? {
+    // A JSON boolean bridges to NSNumber, and `as? Int` would read true as 1.
+    if let n = args[key] as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
     if let i = args[key] as? Int { return i }
-    if let d = args[key] as? Double { return Int(d) }
+    // Int(Double) traps on a value outside Int's range, and a model can send
+    // 1e30: that killed the whole server mid-conversation. Out of range reads
+    // as nil, and tools/call refuses it through invalidIntegerArgument.
+    if let d = args[key] as? Double { return Int(exactly: d.rounded(.towardZero)) }
     if let s = args[key] as? String { return Int(s) }
+    return nil
+}
+
+/// What is wrong with the first argument the tool's schema declares an integer
+/// but that cannot be read as one, or nil if there is nothing wrong. Falling back
+/// to the tool's default was silent: `limit: "abc"` answered with 40 rows, as if
+/// that were what was asked for. An explicit null means absent.
+func invalidIntegerArgument(_ tool: Tool, _ args: [String: Any]) -> String? {
+    guard let properties = tool.schema["properties"] as? [String: Any] else { return nil }
+    for key in properties.keys.sorted() {
+        guard (properties[key] as? [String: Any])?["type"] as? String == "integer",
+              let value = args[key], !(value is NSNull), int(args, key) == nil else { continue }
+        let shown = value is String ? "\"\(value)\"" : "\(value)"
+        return "`\(key)` must be a whole number, got \(shown.prefix(80)). Leave it out to use the default."
+    }
     return nil
 }
 
@@ -1105,17 +1125,21 @@ func daysBack(toLocalDate s: String) -> Int? {
 }
 
 /// `remynd calls` output, one record per call: its line plus the indented lines under it.
-func callRecords(days: Int) -> (records: [String], ok: Bool, raw: String) {
+/// `scope` is which profile answered and what it left out, for an answer built from the records.
+func callRecords(days: Int) -> (records: [String], ok: Bool, raw: String, scope: String) {
     let r = runCLI(["calls", String(days)], timeout: 30)
     var recs: [String] = []
+    var scope: [String] = []
     for line in r.out.components(separatedBy: "\n") {
         if line.range(of: #"^  \d{4}-\d{2}-\d{2}  "#, options: .regularExpression) != nil {
             recs.append(line)
         } else if line.hasPrefix("      "), !recs.isEmpty {
             recs[recs.count - 1] += "\n" + line
+        } else if line.hasPrefix("From profile: ") || line.hasPrefix("Not read here: ") {
+            scope.append(line)
         }
     }
-    return (recs, r.ok, r.out)
+    return (recs, r.ok, r.out, scope.joined(separator: "\n"))
 }
 
 /// The CLI's own next-step hints name CLI commands; say the tool names instead.
@@ -1140,10 +1164,10 @@ func listCallsText(_ a: [String: Any]) -> (String, Bool) {
         let day = String(date.prefix(10))
         let hits = c.records.filter { $0.hasPrefix("  \(day)  ") }
         if hits.isEmpty {
-            return ("No calls were recorded on \(day). A meeting ReMynd did not hear can still show up in reconstruct_day as a Zoom or Meet window.", true)
+            return ("This profile has no calls on \(day). A meeting ReMynd did not hear can still show up in reconstruct_day as a Zoom or Meet window.\n\n" + c.scope, true)
         }
         return ("# Calls on \(day)\n\n" + hits.joined(separator: "\n")
-                + "\n\nRead what was said: call_transcript with call set to the id in brackets.", true)
+                + "\n\nRead what was said: call_transcript with call set to the id in brackets.\n\n" + c.scope, true)
     }
     let days = max(1, min(3650, int(a, "days") ?? 14))
     let c = callRecords(days: days)
@@ -1267,11 +1291,12 @@ let tools: [Tool] = [
              // that day's calls up front so a meeting is never read as silence.
              guard r.ok, let back = daysBack(toLocalDate: d) else { return (r.out, r.ok) }
              let day = String(d.prefix(10))
-             let calls = callRecords(days: back).records.filter { $0.hasPrefix("  \(day)  ") }
+             let c = callRecords(days: back)
+             let calls = c.records.filter { $0.hasPrefix("  \(day)  ") }
              guard !calls.isEmpty else { return (r.out, r.ok) }
              let section = "## Calls recorded that day — audio, transcribed\n\n"
                  + "The screen history below cannot hear. What was said on these calls is in call_transcript "
-                 + "(call: the id in brackets).\n\n" + calls.joined(separator: "\n")
+                 + "(call: the id in brackets).\n\n" + calls.joined(separator: "\n") + "\n\n" + c.scope
              var parts = r.out.components(separatedBy: "\n")
              if let head = parts.first, head.hasPrefix("# ") {
                  parts.removeFirst()
@@ -1581,6 +1606,12 @@ func handle(_ msg: [String: Any]) -> [String: Any]? {
             return errorResponse(id, -32602, "Unknown tool: \(params["name"] as? String ?? "?")")
         }
         let args = params["arguments"] as? [String: Any] ?? [:]
+
+        if let problem = invalidIntegerArgument(tool, args) {
+            logClientEvent("tools/call \(tool.name) images=0 isError=true")
+            return ["jsonrpc": "2.0", "id": id ?? NSNull(),
+                    "result": ["content": [["type": "text", "text": problem]], "isError": true]]
+        }
 
         // ChatGPT's `search`/`fetch` want structuredContent, and the same
         // object JSON-encoded in the text content for clients that only read

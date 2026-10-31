@@ -31,11 +31,70 @@ _here="$(cd "$(dirname "$_self")" && pwd)"
 
 die() { printf 'remynd: %s\n' "$*" >&2; exit 1; }
 
+require_positive_integer() {
+  local value="$1" label="$2" maximum="$3"
+  case "$value" in
+    ''|*[!0-9]*) die "$label must be a positive whole number, got \"$value\"" ;;
+  esac
+  [ "$value" -gt 0 ] || die "$label must be greater than zero"
+  [ "$value" -le "$maximum" ] || die "$label must be at most $maximum"
+}
+
 _profile() {
-  local p
-  p="$(remynd_find_profile)" || die "no ReMynd recordings found on this Mac.
+  local p why
+  if p="$(remynd_find_profile)"; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  why="$(_remynd_stale_pin)"
+  [ -z "$why" ] || die "$why"
+  die "no ReMynd recordings found on this Mac.
 Is ReMynd installed and has it recorded yet? (Set REMYND_PROFILE to override.)"
-  printf '%s\n' "$p"
+}
+
+# What is wrong when a pin is why no profile was found, or nothing. Containers have
+# been renamed before, and a stale pin must not read as an empty history.
+_remynd_stale_pin() {
+  local pin="${REMYND_PROFILE:-}" set_by="REMYND_PROFILE"
+  if [ -z "$pin" ]; then
+    pin="$(remynd_config_get profile "")"
+    set_by="profile= in $(remynd_state_dir)/config"
+  fi
+  [ -n "$pin" ] && [ ! -f "$pin/Recordings/app.db" ] || return 0
+  printf 'the pinned profile does not exist: %s (set by %s). Fix the pin or remove it.\n' "$pin" "$set_by"
+}
+
+# `$(remynd_db_path "$(_profile)")` loses the failure in the inner substitution and
+# carries on with an empty path, so a stale pin printed its reason and exited 0.
+_selected_db() {
+  local p
+  p="$(_profile)" || return 1
+  remynd_db_path "$p"
+}
+
+_remynd_profile_label() {
+  case "$(basename "$1")" in
+    *-dev-*|*-dev) printf '%s (development)\n' "$(basename "$1")" ;;
+    *)             printf '%s (production)\n' "$(basename "$1")" ;;
+  esac
+}
+
+# One line naming the other profiles on this Mac that hold calls, or nothing. Calls read
+# one profile, so an answer has to say what it left out: a call can exist only in another.
+_remynd_other_profiles_line() {
+  local selected="${1%/}" base="$HOME/Library/Application Support/Move37" d e n list=""
+  for d in "$base"/ReMynd-* "$base"/ScreenomeX-*; do
+    [ -d "$d" ] && [ "$d" != "$selected" ] || continue
+    case "$(basename "$d")" in
+      *-fresh-backup|*-backup|*BackupTree*) continue ;;
+    esac
+    e="$(remynd_extras_db_path "$d")"
+    [ -f "$e" ] || continue
+    n="$(remynd_sql_num "$e" "SELECT COUNT(*) FROM Call;")"
+    case "$n" in ''|0|*[!0-9]*) continue ;; esac
+    list="${list:+$list; }$(_remynd_profile_label "$d"), $n call$([ "$n" = 1 ] || printf s)"
+  done
+  [ -z "$list" ] || printf 'Not read here: %s. To read one, set REMYND_PROFILE to its folder in %s.\n' "$list" "$base"
 }
 
 usage() {
@@ -69,14 +128,15 @@ USAGE
 }
 
 cmd_now() {
-  local db; db="$(remynd_db_path "$(_profile)")"
+  local db; db="$(_selected_db)" || exit 1
   local n; n="$(remynd_now "$db")"
   [ -n "$n" ] && echo "$n" || echo "(nothing recorded yet)"
 }
 
 cmd_recent() {
   local mins="${1:-30}" db redact
-  db="$(remynd_db_path "$(_profile)")"
+  require_positive_integer "$mins" "minutes" 10080
+  db="$(_selected_db)" || exit 1
   redact="$(remynd_config_get redact_credentials 1)"
   remynd_digest_full "$db" "$mins" "$(remynd_config_get session_budget_tokens 8000)" "$redact"
 }
@@ -85,7 +145,8 @@ cmd_recent() {
 cmd_search() {
   [ $# -ge 1 ] || die "usage: remynd search <query> [limit]"
   local q="$1" limit="${2:-40}" db redact
-  db="$(remynd_db_path "$(_profile)")"
+  require_positive_integer "$limit" "limit" 1000
+  db="$(_selected_db)" || exit 1
   redact="$(remynd_config_get redact_credentials 1)"
 
   # FTS5 MATCH. Single quotes doubled for SQL; the query is passed as a
@@ -122,7 +183,7 @@ cmd_search() {
 cmd_day() {
   [ $# -ge 1 ] || die "usage: remynd day <YYYY-MM-DD>"
   local day="$1" db next
-  db="$(remynd_db_path "$(_profile)")"
+  db="$(_selected_db)" || exit 1
   next="$(/bin/date -j -v+1d -f '%Y-%m-%d' "$day" '+%Y-%m-%d' 2>/dev/null)" || die "bad date: $day"
 
   # The user means a LOCAL day; the database is in UTC. Convert both ends.
@@ -248,7 +309,8 @@ EOS
 
 cmd_apps() {
   local days="${1:-7}" db since
-  db="$(remynd_db_path "$(_profile)")"
+  require_positive_integer "$days" "days" 3650
+  db="$(_selected_db)" || exit 1
   since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S')"
   local lo; lo="$since"
   echo "# Time by app, last $days days"
@@ -266,7 +328,7 @@ cmd_apps() {
 cmd_text() {
   [ $# -ge 1 ] || die "usage: remynd text <from> [to]      e.g. remynd text \"2026-08-13 23:30\" \"2026-08-13 23:45\""
   local from="$1" to="${2:-}" db redact lo hi
-  db="$(remynd_db_path "$(_profile)")"
+  db="$(_selected_db)" || exit 1
   redact="$(remynd_config_get redact_credentials 1)"
   case "$from" in *:*:*) ;; *:*) from="$from:00" ;; *) from="$from 00:00:00" ;; esac
   from="$(remynd_local_to_utc "$from")" || die "bad time: $1"
@@ -298,7 +360,8 @@ cmd_text() {
 cmd_status() {
   local p db state
   if ! p="$(remynd_find_profile 2>/dev/null)"; then
-    echo "ReMynd:      not found"
+    local why; why="$(_remynd_stale_pin)"
+    echo "ReMynd:      ${why:-not found}"
     echo "Sync:        inactive (nothing to read yet)"
     return 0
   fi
@@ -321,14 +384,15 @@ cmd_status() {
   [ -n "$last" ] && echo "Last capture: $last (local time)"
   echo "Redaction:   $([ "$(remynd_config_get redact_credentials 1)" = "1" ] && echo "on (credential-shaped strings)" || echo "OFF")"
 
-  # Calls live in a different database and are merged across every profile, so
-  # they get their own line. Without it, "no calls" and "this build has no
-  # calls" look the same, and only one of them is true.
+  # Calls live in a different database, so they get their own line. Without it,
+  # "no calls" and "this build has no calls" look the same, and only one is true.
   local calls; calls="$(_remynd_call_rows 2>/dev/null |
     /usr/bin/awk -F'\t' '{ n++; if ($7 + 0 > 0) t++; if (last == "") last = $2; first = $2 }
       END { if (n) printf "%d recorded, %d transcribed (%s -> %s)", n, t, substr(first,1,10), substr(last,1,10)
-            else printf "none recorded" }')"
+            else printf "none recorded in this profile" }')"
   echo "Calls:       $calls"
+  local others; others="$(_remynd_other_profiles_line "$p")"
+  [ -z "$others" ] || echo "             $others"
   echo "Enabled:     $([ "$(remynd_config_get enabled 1)" = "1" ] && echo yes || echo no)"
   if [ -f "$state/context.md" ]; then
     echo "Cache:       $(remynd_tokens_of_file "$state/context.md") tokens, refreshed $(_ago $(( now - $(stat -f %m "$state/context.md") ))) ago"
@@ -361,7 +425,7 @@ _ago() {
 cmd_moments() {
   [ $# -ge 1 ] || die "usage: remynd moments <query> [limit]"
   local q="$1" limit="${2:-20}" db redact esc
-  db="$(remynd_db_path "$(_profile)")"
+  db="$(_selected_db)" || exit 1
   redact="$(remynd_config_get redact_credentials 1)"
   esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
 
@@ -415,7 +479,8 @@ cmd_moments() {
 cmd_moment() {
   [ $# -ge 1 ] || die "usage: remynd moment <YYYY-MM-DD HH:MM:SS> [minutes]"
   local ts="$1" span="${2:-4}" db ts_utc
-  db="$(remynd_db_path "$(_profile)")"
+  require_positive_integer "$span" "minutes" 120
+  db="$(_selected_db)" || exit 1
   ts_utc="$(remynd_local_to_utc "$ts")" || die "bad timestamp: $ts"
 
   # The window that was focused at that instant. Same rowid-ordering trick as
@@ -449,26 +514,24 @@ cmd_moment() {
 # and the audio are both sitting on disk. That is the whole reason these
 # commands exist.
 #
-# Calls are also the worst case for the split-profile problem cmd_day warns
-# about: they are few, they are long, and each one lands in whichever profile
-# held the recorder that hour. Worse, when two builds run at once BOTH
-# transcribe the same meeting, and they do it unevenly — one copy came back
-# with speaker labels, a title and a participant list, the other with 437
-# anonymous lines. So these commands read EVERY profile and merge, ignoring
-# the pinned one, and when two rows describe one meeting they keep the copy
-# that actually knows who was talking.
+# These commands read the SELECTED profile only, like every other command here
+# and like the CLI bundled in the ReMynd app. They used to read every profile and
+# merge, so "the last call" could come from a development build while the app
+# answered from production, and two different meetings in one app within five
+# minutes were taken for one recording of the same meeting and collapsed. A call
+# that landed in another profile is reached with REMYND_PROFILE.
 # ---------------------------------------------------------------------------
 
 remynd_extras_db_path() { printf '%s/Recordings/Extras/extras.db\n' "$1"; }
 
 _remynd_extras_dbs() {
-  local e
-  for e in "$HOME/Library/Application Support/Move37/"*/Recordings/Extras/extras.db; do
-    [ -f "$e" ] && printf '%s\n' "$e"
-  done
+  local p e
+  p="$(_profile)" || return 1
+  e="$(remynd_extras_db_path "$p")"
+  [ -f "$e" ] && printf '%s\n' "$e"
 }
 
-# Every call from every profile, deduped, newest first. Tab-separated:
+# Every call in the selected profile, newest first. Tab-separated:
 #   epoch  start_local  end_local  app  title  participants  lines  speakers  id  secs  extras_db
 _remynd_call_rows() {
   local since_utc="${1:-0001-01-01 00:00:00}" e
@@ -493,31 +556,7 @@ _remynd_call_rows() {
       'NF >= 10 && $1 != "" { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                                      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,db }'
   done < <(_remynd_extras_dbs) |
-  /usr/bin/sort -t"$(printf '\t')" -k1,1nr |
-  /usr/bin/awk -F'\t' -v OFS='\t' '
-    # Richness, in the order it matters to a reader: knowing WHO spoke beats
-    # knowing what the meeting was called, which beats the guest list. Line
-    # count only breaks ties, because a longer transcript of anonymous
-    # "?: ..." lines is not the better copy.
-    function score(spk, title, parts, lines) {
-      return (spk + 0 > 0 ? 4000000 : 0) + (title != "" ? 2000000 : 0) \
-           + (parts != "" ? 1000000 : 0) + (lines + 0)
-    }
-    {
-      s = score($8, $5, $6, $7)
-      for (i = 1; i <= n; i++) {
-        # One meeting, two recorders: the builds start their call timers
-        # seconds to a couple of minutes apart, so match on app plus a
-        # five-minute window rather than on an id neither shares.
-        split(keep[i], k, "\t")
-        if (k[4] == $4 && (k[1] - $1 < 300 && $1 - k[1] < 300)) {
-          if (s > kscore[i]) { keep[i] = $0; kscore[i] = s }
-          next
-        }
-      }
-      n++; keep[n] = $0; kscore[n] = s
-    }
-    END { for (i = 1; i <= n; i++) print keep[i] }'
+  /usr/bin/sort -t"$(printf '\t')" -k1,1nr
 }
 
 # "[\"Ann\",\"Bo\"]" -> "Ann, Bo". The column is a JSON array; nothing here
@@ -534,9 +573,13 @@ AWKF
 
 cmd_calls() {
   local days="${1:-14}" since
+  require_positive_integer "$days" "days" 3650
   since="$(/bin/date -u -v-"${days}"d '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" || die "bad day count: $days"
+  local profile others
+  profile="$(_profile)" || exit 1
 
   echo "# Calls recorded, last $days days"
+  echo "From profile: $(_remynd_profile_label "$profile")"
   echo
   _remynd_call_rows "$since" |
   /usr/bin/awk -F'\t' '
@@ -560,9 +603,11 @@ cmd_calls() {
       n++
     }
     END {
-      if (n == 0) print "  (no calls recorded in that window — try a wider one: remynd calls 90)"
+      if (n == 0) print "  (no calls recorded in this profile in that window — try a wider one: remynd calls 90)"
       else printf "\nFull transcript:  remynd call <id>        Audio file:  remynd call <id> --audio\n"
     }'
+  others="$(_remynd_other_profiles_line "$profile")"
+  [ -z "$others" ] || printf '\n%s\n' "$others"
 }
 
 # One call, in full. The selector is an id, `last`, or any fragment of the
@@ -580,8 +625,13 @@ cmd_call() {
   done
   [ -n "$sel" ] || die "usage: remynd call <id|last|fragment> [--audio]"
 
+  local profile label others
+  profile="$(_profile)" || exit 1
+  label="$(_remynd_profile_label "$profile")"
+  others="$(_remynd_other_profiles_line "$profile")"
+
   local rows; rows="$(_remynd_call_rows)"
-  [ -n "$rows" ] || die "no calls have been recorded on this Mac yet."
+  [ -n "$rows" ] || die "no calls recorded in profile $label.${others:+ $others}"
 
   local hits
   if [ "$sel" = "last" ] || [ "$sel" = "latest" ]; then
@@ -589,14 +639,15 @@ cmd_call() {
   else
     hits="$(printf '%s\n' "$rows" |
       /usr/bin/awk -F'\t' -v q="$(printf '%s' "$sel" | /usr/bin/tr '[:upper:]' '[:lower:]')" '
-        $9 == q { print; found = 1; exit }
+        $9 == q { exact = $0 }
         { hay = tolower($2 " " $4 " " $5 " " $6)
-          if (index(hay, q)) print }')"
+          if (index(hay, q)) matches = matches $0 "\n" }
+        END { if (exact != "") print exact; else printf "%s", matches }')"
   fi
 
   local count; count="$(printf '%s' "$hits" | /usr/bin/grep -c . || true)"
   if [ "${count:-0}" -eq 0 ]; then
-    die "no call matches \"$sel\". List what there is with: remynd calls 90"
+    die "no call matches \"$sel\" in profile $label. List what there is with: remynd calls 90${others:+ $others}"
   fi
   if [ "${count:-0}" -gt 1 ]; then
     echo "\"$sel\" matches $count calls — pick one by id:" >&2
@@ -622,6 +673,8 @@ cmd_call() {
   fi
 
   echo "# ${title:-Untitled call}"
+  echo "From profile: $label"
+  [ -z "$others" ] || echo "$others"
   echo
   echo "  $app · $start${end:+ – ${end:11:8}}"
   [ -n "$parts" ] && printf '  With: %s\n' \
@@ -654,15 +707,11 @@ cmd_call() {
 cmd_heard() {
   [ $# -ge 1 ] || die "usage: remynd heard <query> [limit]"
   local q="$1" limit="${2:-30}" esc redact e printed=0
+  require_positive_integer "$limit" "limit" 1000
+  local profile others
+  profile="$(_profile)" || exit 1
   esc="$(printf '%s' "$q" | /usr/bin/sed "s/'/''/g")"
   redact="$(remynd_config_get redact_credentials 1)"
-
-  # When two builds recorded the same meeting they also transcribed it twice,
-  # so an unfiltered search returns every hit twice in slightly different
-  # words — which reads as two separate calls saying nearly the same thing.
-  # Reuse the merge: keep hits only from the copy `remynd calls` settled on.
-  local keep_ids
-  keep_ids="$(_remynd_call_rows | /usr/bin/awk -F'\t' '{ printf "%s,", $9 }')"
 
   while IFS= read -r e; do
     [ -n "$e" ] || continue
@@ -681,18 +730,19 @@ cmd_heard() {
     /usr/bin/awk -F"$REMYND_FS" -v OFS='\t' 'NF >= 5 { print $1, $2, $3, $4, $5 }'
   done < <(_remynd_extras_dbs) |
   /usr/bin/sort -t"$(printf '\t')" -k1,1r |
-  /usr/bin/awk -F'\t' -v doredact="$redact" -v lim="$limit" -v keep="$keep_ids" '
+  /usr/bin/awk -F'\t' -v doredact="$redact" -v lim="$limit" '
 '"$(_remynd_redact_awk)"'
-    BEGIN { n_keep = split(keep, kk, ","); for (i = 1; i <= n_keep; i++) if (kk[i] != "") ok[kk[i]] = 1 }
-    { if (!($4 in ok)) next
-      key = $1 " " substr($5, 1, 60)
+    { key = $1 " " substr($5, 1, 60)
       if (key in seen) next
       seen[key] = 1
       if (n++ >= lim) exit
       t = $5; if (doredact == 1) t = redact(t)
       printf "%s  %s  [%s · %s]\n      %s: %s\n", substr($1,1,10), substr($1,12,5), $3, $4, $2, t }
-    END { if (n == 0) print "(nothing matching was said in any recorded call — try fewer words)"
+    END { if (n == 0) print "(nothing matching was said in this profile'"'"'s calls — try fewer words)"
           else printf "\nRead one in full:  remynd call <id>\n" }'
+  printf '\nFrom profile: %s\n' "$(_remynd_profile_label "$profile")"
+  others="$(_remynd_other_profiles_line "$profile")"
+  [ -z "$others" ] || printf '%s\n' "$others"
 }
 
 cmd_refresh() { "$_here/remynd-refresh.sh" --force && cmd_status; }
